@@ -96,19 +96,24 @@ async function computeStandings(db) {
   const teams = (await db.collection('teams').find({}).toArray()).map(stripId)
   const matches = (await db.collection('matches').find({ status: { $in: ['confirmed', 'admin_approved'] } }).toArray()).map(stripId)
   const stats = {}
-  for (const t of teams) stats[t.id] = { team_id: t.id, team_name: t.name, played: 0, won: 0, lost: 0, drawn: 0, points_for: 0, points_against: 0, saldo: 0, total_points: 0 }
+  for (const t of teams) stats[t.id] = { team_id: t.id, team_name: t.name, played: 0, won: 0, lost: 0, drawn: 0, points_for: 0, points_against: 0, frames_won: 0, frames_lost: 0, framebalans: 0, saldo: 0, comp_points: 0, total_points: 0 }
   for (const m of matches) {
     if (!m.games) continue
     const s = stats[m.home_team_id], s2 = stats[m.away_team_id]; if (!s || !s2) continue
     s.played += 1; s2.played += 1
     s.points_for += m.points_home; s.points_against += m.points_away
     s2.points_for += m.points_away; s2.points_against += m.points_home
-    if (m.points_home > m.points_away) { s.won += 1; s2.lost += 1 }
-    else if (m.points_home < m.points_away) { s2.won += 1; s.lost += 1 }
-    else { s.drawn += 1; s2.drawn += 1 }
+    for (const g of m.games) {
+      const hf = Number(g.home_frames) || 0, af = Number(g.away_frames) || 0
+      s.frames_won += hf; s.frames_lost += af
+      s2.frames_won += af; s2.frames_lost += hf
+    }
+    if (m.points_home > m.points_away) { s.won += 1; s.comp_points += 3; s2.lost += 1 }
+    else if (m.points_home < m.points_away) { s2.won += 1; s2.comp_points += 3; s.lost += 1 }
+    else { s.drawn += 1; s2.drawn += 1; s.comp_points += 1; s2.comp_points += 1 }
   }
-  for (const id in stats) { stats[id].saldo = stats[id].points_for - stats[id].points_against; stats[id].total_points = stats[id].points_for }
-  return Object.values(stats).sort((a, b) => b.total_points - a.total_points || b.saldo - a.saldo || b.won - a.won)
+  for (const id in stats) { stats[id].framebalans = stats[id].frames_won - stats[id].frames_lost; stats[id].saldo = stats[id].points_for - stats[id].points_against; stats[id].total_points = stats[id].comp_points }
+  return Object.values(stats).sort((a, b) => b.comp_points - a.comp_points || b.framebalans - a.framebalans || b.frames_won - a.frames_won || a.team_name.localeCompare(b.team_name))
 }
 async function computePlayerStats(db) {
   const players = (await db.collection('players').find({}).toArray()).map(stripId)
@@ -117,17 +122,18 @@ async function computePlayerStats(db) {
   const rules = await getScoring(db)
   const matches = (await db.collection('matches').find({ status: { $in: ['confirmed', 'admin_approved'] } }).toArray()).map(stripId)
   const stats = {}
-  for (const p of players) stats[p.id] = { player_id: p.id, name: p.name, team_id: p.team_id, team_name: tmap[p.team_id] || '', played: 0, won: 0, lost: 0, enkel_played: 0, enkel_won: 0, dubbel_played: 0, dubbel_won: 0, points: 0 }
+  for (const p of players) stats[p.id] = { player_id: p.id, name: p.name, team_id: p.team_id, team_name: tmap[p.team_id] || '', is_placeholder: !!p.is_placeholder, played: 0, won: 0, lost: 0, enkel_played: 0, enkel_won: 0, enkel_frames_won: 0, enkel_frames_lost: 0, enkel_points: 0, dubbel_played: 0, dubbel_won: 0, dubbel_frames_won: 0, dubbel_frames_lost: 0, dubbel_points: 0, points: 0 }
   for (const m of matches) {
     if (!m.games) continue
     for (const g of m.games) {
       const pts = pointsForFrames(g.home_frames, g.away_frames, rules)
       const homeWon = pts.home > pts.away, awayWon = pts.away > pts.home
-      for (const pid of g.home_players || []) { const s = stats[pid]; if (!s) continue; s.played += 1; s.points += pts.home; if (homeWon) s.won += 1; else if (awayWon) s.lost += 1; if (g.type === 'enkel') { s.enkel_played += 1; if (homeWon) s.enkel_won += 1 } else { s.dubbel_played += 1; if (homeWon) s.dubbel_won += 1 } }
-      for (const pid of g.away_players || []) { const s = stats[pid]; if (!s) continue; s.played += 1; s.points += pts.away; if (awayWon) s.won += 1; else if (homeWon) s.lost += 1; if (g.type === 'enkel') { s.enkel_played += 1; if (awayWon) s.enkel_won += 1 } else { s.dubbel_played += 1; if (awayWon) s.dubbel_won += 1 } }
+      const hf = Number(g.home_frames) || 0, af = Number(g.away_frames) || 0
+      for (const pid of g.home_players || []) { const s = stats[pid]; if (!s) continue; s.played += 1; s.points += pts.home; if (homeWon) s.won += 1; else if (awayWon) s.lost += 1; if (g.type === 'enkel') { s.enkel_played += 1; s.enkel_points += pts.home; s.enkel_frames_won += hf; s.enkel_frames_lost += af; if (homeWon) s.enkel_won += 1 } else { s.dubbel_played += 1; s.dubbel_points += pts.home; s.dubbel_frames_won += hf; s.dubbel_frames_lost += af; if (homeWon) s.dubbel_won += 1 } }
+      for (const pid of g.away_players || []) { const s = stats[pid]; if (!s) continue; s.played += 1; s.points += pts.away; if (awayWon) s.won += 1; else if (homeWon) s.lost += 1; if (g.type === 'enkel') { s.enkel_played += 1; s.enkel_points += pts.away; s.enkel_frames_won += af; s.enkel_frames_lost += hf; if (awayWon) s.enkel_won += 1 } else { s.dubbel_played += 1; s.dubbel_points += pts.away; s.dubbel_frames_won += af; s.dubbel_frames_lost += hf; if (awayWon) s.dubbel_won += 1 } }
     }
   }
-  return Object.values(stats).map(s => ({ ...s, win_pct: s.played ? Math.round((s.won / s.played) * 100) : 0 })).sort((a, b) => b.points - a.points || b.won - a.won)
+  return Object.values(stats).filter(s => !s.is_placeholder).map(s => { const tfw = s.enkel_frames_won + s.dubbel_frames_won; const tfl = s.enkel_frames_lost + s.dubbel_frames_lost; return { ...s, total_frames_won: tfw, total_frames_lost: tfl, framebalans: tfw - tfl, win_pct: s.played ? Math.round((s.won / s.played) * 100) : 0 } }).sort((a, b) => b.points - a.points || b.total_frames_won - a.total_frames_won || b.framebalans - a.framebalans || a.name.localeCompare(b.name))
 }
 
 // -------- Auth helpers --------
@@ -419,6 +425,96 @@ async function handleRoute(request, { params }) {
       const teams = (await db.collection('teams').find({}).toArray()).map(stripId)
       const tmap = Object.fromEntries(teams.map(t => [t.id, t.name]))
       return handleCORS(NextResponse.json(matches.map(m => ({ ...m, home_team_name: tmap[m.home_team_id], away_team_name: tmap[m.away_team_id] }))))
+    }
+
+    // Import historic season from Excel
+    if (route === '/admin/setup-2026-2027' && method === 'POST') {
+      if (!isAdmin) return handleCORS(NextResponse.json({ error: 'unauthorized' }, { status: 401 }))
+      const normalize = (s) => (s || '').toLowerCase().replace(/[_\s]+/g, ' ').trim()
+      const TEAM_NAMES = ['Den Telstar', 'Canada', 'Arena', 'De Sportwereld', 'Silver Balls', 'De Kroon']
+      const TEAM_CODES = { 'Den Telstar': 'TEL-4928', 'Canada': 'CAN-7281', 'Arena': 'ARE-1954', 'De Sportwereld': 'SPO-3672', 'Silver Balls': 'SIL-8340', 'De Kroon': 'KRO-6135' }
+
+      // Archive current active season if not already 2026-2027
+      const active = stripId(await db.collection('seasons').findOne({ active: true }))
+      if (active && active.name !== '2026-2027') {
+        const standings = await computeStandings(db)
+        const pstats = await computePlayerStats(db)
+        await db.collection('seasons').updateOne({ id: active.id }, { $set: { active: false, archived_at: new Date().toISOString(), final_standings: standings, final_player_stats: pstats, champion: standings[0]?.team_name || null } })
+      }
+      // Ensure 2026-2027 season exists and is active
+      let season = stripId(await db.collection('seasons').findOne({ name: '2026-2027' }))
+      if (!season) { season = { id: uuidv4(), name: '2026-2027', active: true, created_at: new Date().toISOString() }; await db.collection('seasons').insertOne(season) }
+      else await db.collection('seasons').updateOne({ id: season.id }, { $set: { active: true } })
+
+      // Case-insensitive team dedup + rename to canonical (behandel "De Canada" en "Canada" als zelfde)
+      const allExisting = (await db.collection('teams').find({}).toArray()).map(stripId)
+      const teamByNorm = {}
+      for (const t of allExisting) { const n = normalize(t.name); const key = (n === 'de canada') ? 'canada' : n; if (!teamByNorm[key]) teamByNorm[key] = t }
+      const teamIdByName = {}
+      for (const name of TEAM_NAMES) {
+        const key = normalize(name)
+        const existing = teamByNorm[key]
+        if (existing) { if (existing.name !== name) await db.collection('teams').updateOne({ id: existing.id }, { $set: { name } }); teamIdByName[name] = existing.id }
+        else { const nt = { id: uuidv4(), name, code: TEAM_CODES[name], season_id: season.id, created_at: new Date().toISOString() }; await db.collection('teams').insertOne(nt); teamIdByName[name] = nt.id }
+      }
+
+      // Ensure Den Telstar players (dedupe case-insensitive)
+      const TELSTAR = ['Aron Pauwels','Bob Dumont','Danny Breeur','Dave Hemmerechts','Dirk Jacobs Pluto','Dirk Myncke','Dirk Willems','Feline Van Barel','Jesper Slegers','Johan Thijs','Johannes Oksuz','Johnny Geysen','Peter Vertongen','Rene Mattijns','Rik Peeters','Sam Lambregts','Werner Verdonck']
+      const telstarId = teamIdByName['Den Telstar']
+      const existingP = (await db.collection('players').find({ team_id: telstarId }).toArray()).map(stripId)
+      const existingNorm = new Set(existingP.map(p => normalize(p.name)))
+      const now = new Date().toISOString()
+      for (const name of TELSTAR) if (!existingNorm.has(normalize(name))) await db.collection('players').insertOne({ id: uuidv4(), team_id: telstarId, name, active: true, locked: true, joined_at: now, can_play_from: now })
+
+      // Placeholder "Speler te kort" for every team
+      for (const teamName of TEAM_NAMES) {
+        const tid = teamIdByName[teamName]
+        const ph = await db.collection('players').findOne({ team_id: tid, is_placeholder: true })
+        if (!ph) await db.collection('players').insertOne({ id: uuidv4(), team_id: tid, name: 'Speler te kort', active: false, locked: true, is_placeholder: true, joined_at: now, can_play_from: now })
+      }
+
+      // Remove old scheduled matches from previous seasons only
+      await db.collection('matches').deleteMany({ status: 'scheduled', season_id: { $ne: season.id } })
+
+      // Real calendar (from user brief)
+      const CAL = [
+        ['2026-09-13', 'Arena', 'Silver Balls'], ['2026-09-13', 'De Kroon', 'Canada'], ['2026-09-13', 'De Sportwereld', 'Den Telstar'],
+        ['2026-09-27', 'Canada', 'Arena'], ['2026-09-27', 'Silver Balls', 'De Sportwereld'], ['2026-09-27', 'Den Telstar', 'De Kroon'],
+        ['2026-10-11', 'Canada', 'Silver Balls'], ['2026-10-11', 'Arena', 'Den Telstar'], ['2026-10-11', 'De Kroon', 'De Sportwereld'],
+        ['2026-10-25', 'Den Telstar', 'Canada'], ['2026-10-25', 'De Sportwereld', 'Arena'], ['2026-10-25', 'Silver Balls', 'De Kroon'],
+        ['2026-11-15', 'Canada', 'De Sportwereld'], ['2026-11-15', 'Arena', 'De Kroon'], ['2026-11-15', 'Den Telstar', 'Silver Balls'],
+        ['2026-11-29', 'Silver Balls', 'Canada'], ['2026-11-29', 'Den Telstar', 'De Sportwereld'], ['2026-11-29', 'De Kroon', 'Arena'],
+        ['2026-12-13', 'Arena', 'Canada'], ['2026-12-13', 'De Sportwereld', 'Silver Balls'], ['2026-12-13', 'De Kroon', 'Den Telstar'],
+        ['2026-12-27', 'Silver Balls', 'Arena'], ['2026-12-27', 'Canada', 'De Kroon'], ['2026-12-27', 'Den Telstar', 'Arena'],
+        ['2027-01-10', 'Canada', 'Den Telstar'],
+        ['2027-01-24', 'Silver Balls', 'Den Telstar'],
+        ['2027-02-07', 'De Sportwereld', 'Den Telstar'],
+        ['2027-02-21', 'Den Telstar', 'De Kroon'],
+        ['2027-03-07', 'Arena', 'Den Telstar'],
+        ['2027-03-21', 'Den Telstar', 'Canada'],
+        ['2027-04-04', 'Den Telstar', 'Silver Balls'],
+        ['2027-04-18', 'Den Telstar', 'De Sportwereld'],
+        ['2027-05-02', 'De Kroon', 'Den Telstar'],
+        ['2027-05-16', 'Den Telstar', 'Arena'],
+        ['2027-05-30', 'Canada', 'Den Telstar'],
+        ['2027-06-13', 'De Sportwereld', 'Den Telstar'],
+      ]
+      const existingMatches = (await db.collection('matches').find({ season_id: season.id }).toArray()).map(stripId)
+      const existingKey = new Set(existingMatches.map(m => `${(m.date||'').substring(0,10)}|${m.home_team_id}|${m.away_team_id}`))
+      const startDate = new Date('2026-09-13')
+      let created = 0
+      for (const [dateStr, homeName, awayName] of CAL) {
+        const homeId = teamIdByName[homeName]; const awayId = teamIdByName[awayName]
+        if (!homeId || !awayId) continue
+        const key = `${dateStr}|${homeId}|${awayId}`
+        if (existingKey.has(key)) continue
+        const d = new Date(dateStr)
+        const week = Math.floor((d - startDate) / (14 * 86400000)) + 1
+        await db.collection('matches').insertOne({ id: uuidv4(), season_id: season.id, week, date: new Date(dateStr + 'T20:00:00').toISOString(), home_team_id: homeId, away_team_id: awayId, status: 'scheduled', games: null, points_home: 0, points_away: 0, submitted_by: null, submitted_at: null, confirmed_at: null })
+        created += 1
+      }
+      await logAudit(db, { actor: 'admin', action: 'season_setup_2026_2027', entity: 'season', entity_id: season.id, old_value: null, new_value: { created_matches: created } })
+      return handleCORS(NextResponse.json({ ok: true, season_id: season.id, created_matches: created, teams: TEAM_NAMES.map(n => ({ name: n, code: TEAM_CODES[n] })) }))
     }
 
     // Import historic season from Excel
