@@ -122,7 +122,7 @@ async function computePlayerStats(db) {
   const rules = await getScoring(db)
   const matches = (await db.collection('matches').find({ status: { $in: ['confirmed', 'admin_approved'] } }).toArray()).map(stripId)
   const stats = {}
-  for (const p of players) stats[p.id] = { player_id: p.id, name: p.name, team_id: p.team_id, team_name: tmap[p.team_id] || '', is_placeholder: !!p.is_placeholder, played: 0, won: 0, lost: 0, enkel_played: 0, enkel_won: 0, enkel_frames_won: 0, enkel_frames_lost: 0, enkel_points: 0, dubbel_played: 0, dubbel_won: 0, dubbel_frames_won: 0, dubbel_frames_lost: 0, dubbel_points: 0, points: 0 }
+  for (const p of players) stats[p.id] = { player_id: p.id, name: p.name, team_id: p.team_id, team_name: tmap[p.team_id] || '', is_placeholder: !!p.is_placeholder, can_play_from: p.can_play_from || null, joined_at: p.joined_at || null, played: 0, won: 0, lost: 0, enkel_played: 0, enkel_won: 0, enkel_frames_won: 0, enkel_frames_lost: 0, enkel_points: 0, dubbel_played: 0, dubbel_won: 0, dubbel_frames_won: 0, dubbel_frames_lost: 0, dubbel_points: 0, points: 0 }
   for (const m of matches) {
     if (!m.games) continue
     for (const g of m.games) {
@@ -419,10 +419,15 @@ async function handleRoute(request, { params }) {
       if (!isAdmin) return handleCORS(NextResponse.json({ error: 'unauthorized' }, { status: 401 }))
       const body = await request.json()
       const joined = new Date()
-      const canPlayFrom = new Date(joined); canPlayFrom.setMonth(canPlayFrom.getMonth() + 2)
+      let canPlayFrom
+      if (body.can_play_from) {
+        canPlayFrom = new Date(body.can_play_from)
+      } else {
+        canPlayFrom = new Date(joined); canPlayFrom.setMonth(canPlayFrom.getMonth() + 2)
+      }
       const p = { id: uuidv4(), team_id: body.team_id, name: body.name, active: true, locked: true, joined_at: joined.toISOString(), can_play_from: canPlayFrom.toISOString() }
       await db.collection('players').insertOne(p)
-      await logAudit(db, { actor: 'admin', action: 'player_created', entity: 'player', entity_id: p.id, old_value: null, new_value: { name: p.name, team_id: p.team_id } })
+      await logAudit(db, { actor: 'admin', action: 'player_created', entity: 'player', entity_id: p.id, old_value: null, new_value: { name: p.name, team_id: p.team_id, can_play_from: canPlayFrom.toISOString() } })
       return handleCORS(NextResponse.json(stripId(p)))
     }
     if (route.startsWith('/admin/players/') && path.length === 3 && method === 'PATCH') {
