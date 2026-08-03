@@ -239,8 +239,11 @@ async function handleRoute(request, { params }) {
       const tmap = Object.fromEntries(allTeams.map(t => [t.id, t.name]))
       const enriched = matches.map(m => ({ ...m, home_team_name: tmap[m.home_team_id], away_team_name: tmap[m.away_team_id] }))
       const pending = (await db.collection('player_change_requests').find({ team_id: team.id }).sort({ ts: -1 }).toArray()).map(stripId)
-      const dateReqs = (await db.collection('date_change_requests').find({ team_id: team.id }).sort({ ts: -1 }).toArray()).map(stripId)
-      return handleCORS(NextResponse.json({ team: { id: team.id, name: team.name, code: team.code }, players, matches: enriched, change_requests: pending, date_change_requests: dateReqs }))
+      const myMatchIds = matches.map(m => m.id)
+      const allDateReqs = (await db.collection('date_change_requests').find({ match_id: { $in: myMatchIds } }).sort({ ts: -1 }).toArray()).map(stripId)
+      const ourDateReqs = allDateReqs.filter(r => r.team_id === team.id)
+      const incomingDateReqs = allDateReqs.filter(r => r.team_id !== team.id && r.status === 'pending').map(r => { const m = enriched.find(x => x.id === r.match_id); return { ...r, match_info: m ? `${m.home_team_name} vs ${m.away_team_name}` : '' } })
+      return handleCORS(NextResponse.json({ team: { id: team.id, name: team.name, code: team.code }, players, matches: enriched, change_requests: pending, date_change_requests: ourDateReqs, incoming_date_requests: incomingDateReqs }))
     }
 
     // Player change request (team)
@@ -257,6 +260,32 @@ async function handleRoute(request, { params }) {
       await db.collection('date_change_requests').insertOne(req)
       await logAudit(db, { actor: team.name, action: 'date_change_requested', entity: 'match', entity_id: m.id, old_value: { date: m.date }, new_value: { date: body.new_date, reason: body.reason } })
       return handleCORS(NextResponse.json({ ok: true, request: req }))
+    }
+
+    // Team responds to opponent's date change request
+    if (route.startsWith('/date-change-requests/') && path.length === 3 && path[2] === 'respond' && method === 'POST') {
+      const body = await request.json()
+      const id = path[1]
+      const team = await verifyTeam(db, body.team_code)
+      if (!team) return handleCORS(NextResponse.json({ error: 'invalid code' }, { status: 403 }))
+      const req = stripId(await db.collection('date_change_requests').findOne({ id }))
+      if (!req) return handleCORS(NextResponse.json({ error: 'not found' }, { status: 404 }))
+      if (req.status !== 'pending') return handleCORS(NextResponse.json({ error: 'not pending' }, { status: 400 }))
+      if (req.team_id === team.id) return handleCORS(NextResponse.json({ error: 'cannot approve own request' }, { status: 403 }))
+      const m = stripId(await db.collection('matches').findOne({ id: req.match_id }))
+      if (!m) return handleCORS(NextResponse.json({ error: 'match not found' }, { status: 404 }))
+      const isOpponent = (team.id === m.home_team_id || team.id === m.away_team_id) && team.id !== req.team_id
+      if (!isOpponent) return handleCORS(NextResponse.json({ error: 'not the opposing team' }, { status: 403 }))
+      const agree = !!body.agree
+      if (agree) {
+        await db.collection('matches').updateOne({ id: m.id }, { $set: { date: req.new_date } })
+        await db.collection('date_change_requests').updateOne({ id }, { $set: { status: 'approved', decided_at: new Date().toISOString(), decided_by: team.name } })
+        await logAudit(db, { actor: team.name, action: 'date_change_approved_by_opponent', entity: 'match', entity_id: m.id, old_value: { date: req.old_date }, new_value: { date: req.new_date } })
+      } else {
+        await db.collection('date_change_requests').updateOne({ id }, { $set: { status: 'rejected', decided_at: new Date().toISOString(), decided_by: team.name, reject_reason: body.reason || '' } })
+        await logAudit(db, { actor: team.name, action: 'date_change_rejected_by_opponent', entity: 'match', entity_id: m.id, old_value: { date: req.old_date }, new_value: { date: req.new_date, reject_reason: body.reason } })
+      }
+      return handleCORS(NextResponse.json({ ok: true, status: agree ? 'approved' : 'rejected' }))
     }
 
     if (route === '/player-change-requests' && method === 'POST') {
