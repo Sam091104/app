@@ -123,8 +123,17 @@ function KlassementPage({ standings }) {
 }
 
 function KalenderPage({ matches }) {
-  const byWeek = useMemo(() => { const g = {}; matches.forEach(m => { g[m.week] = g[m.week] || []; g[m.week].push(m) }); return g }, [matches])
-  return (<div className="container mx-auto px-4 py-6 space-y-4">{Object.keys(byWeek).sort((a,b)=>Number(a)-Number(b)).map(week => (<Card key={week}><CardHeader className="pb-3"><CardTitle className="text-base">Speeldag {week}</CardTitle></CardHeader><CardContent className="space-y-2">{byWeek[week].map(m => (<div key={m.id} className="flex items-center justify-between border-b last:border-b-0 pb-2 last:pb-0"><div><div className="font-medium">{m.home_team_name} <span className="text-muted-foreground text-sm">vs</span> {m.away_team_name}</div><div className="text-xs text-muted-foreground">{formatDate(m.date)}</div></div><div className="flex items-center gap-2">{['confirmed','admin_approved'].includes(m.status) && <span className="font-bold text-emerald-700">{m.points_home} - {m.points_away}</span>}{statusBadge(m.status)}</div></div>))}</CardContent></Card>))}</div>)
+  const byDate = useMemo(() => {
+    const g = {}
+    matches.forEach(m => {
+      const key = (m.date || '').substring(0, 10)
+      g[key] = g[key] || []
+      g[key].push(m)
+    })
+    return g
+  }, [matches])
+  const dateHeader = (iso) => { try { const d = new Date(iso); return d.toLocaleDateString('nl-BE', { weekday: 'long', day: '2-digit', month: 'long', year: 'numeric' }) } catch { return iso } }
+  return (<div className="container mx-auto px-4 py-6 space-y-4">{Object.keys(byDate).sort().map(dateKey => (<Card key={dateKey}><CardHeader className="pb-3"><CardTitle className="text-base flex items-center gap-2"><CalendarDays className="w-4 h-4 text-emerald-600" />{dateHeader(dateKey)}</CardTitle><CardDescription>{byDate[dateKey].length} wedstrijd{byDate[dateKey].length > 1 ? 'en' : ''}</CardDescription></CardHeader><CardContent className="space-y-2">{byDate[dateKey].map(m => (<div key={m.id} className="flex items-center justify-between border-b last:border-b-0 pb-2 last:pb-0"><div><div className="font-medium">{m.home_team_name} <span className="text-muted-foreground text-sm">–</span> {m.away_team_name}</div><div className="text-xs text-muted-foreground">Speeldag {m.week}</div></div><div className="flex items-center gap-2">{['confirmed','admin_approved'].includes(m.status) && <span className="font-bold text-emerald-700">{m.points_home} - {m.points_away}</span>}{statusBadge(m.status)}</div></div>))}</CardContent></Card>))}</div>)
 }
 
 function WedstrijdenPage({ matches, onOpen }) {
