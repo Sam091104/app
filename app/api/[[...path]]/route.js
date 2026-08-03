@@ -239,10 +239,26 @@ async function handleRoute(request, { params }) {
       const tmap = Object.fromEntries(allTeams.map(t => [t.id, t.name]))
       const enriched = matches.map(m => ({ ...m, home_team_name: tmap[m.home_team_id], away_team_name: tmap[m.away_team_id] }))
       const pending = (await db.collection('player_change_requests').find({ team_id: team.id }).sort({ ts: -1 }).toArray()).map(stripId)
-      return handleCORS(NextResponse.json({ team: { id: team.id, name: team.name, code: team.code }, players, matches: enriched, change_requests: pending }))
+      const dateReqs = (await db.collection('date_change_requests').find({ team_id: team.id }).sort({ ts: -1 }).toArray()).map(stripId)
+      return handleCORS(NextResponse.json({ team: { id: team.id, name: team.name, code: team.code }, players, matches: enriched, change_requests: pending, date_change_requests: dateReqs }))
     }
 
     // Player change request (team)
+    // Player change request (team)
+    if (route === '/date-change-requests' && method === 'POST') {
+      const body = await request.json()
+      const team = await verifyTeam(db, body.team_code)
+      if (!team) return handleCORS(NextResponse.json({ error: 'invalid code' }, { status: 403 }))
+      const m = stripId(await db.collection('matches').findOne({ id: body.match_id }))
+      if (!m) return handleCORS(NextResponse.json({ error: 'match not found' }, { status: 404 }))
+      if (m.home_team_id !== team.id && m.away_team_id !== team.id) return handleCORS(NextResponse.json({ error: 'not your match' }, { status: 403 }))
+      if (m.status !== 'scheduled') return handleCORS(NextResponse.json({ error: 'match is not scheduled' }, { status: 400 }))
+      const req = { id: uuidv4(), ts: new Date().toISOString(), team_id: team.id, team_name: team.name, match_id: m.id, old_date: m.date, new_date: body.new_date, reason: body.reason || '', status: 'pending', decided_by: null, decided_at: null }
+      await db.collection('date_change_requests').insertOne(req)
+      await logAudit(db, { actor: team.name, action: 'date_change_requested', entity: 'match', entity_id: m.id, old_value: { date: m.date }, new_value: { date: body.new_date, reason: body.reason } })
+      return handleCORS(NextResponse.json({ ok: true, request: req }))
+    }
+
     if (route === '/player-change-requests' && method === 'POST') {
       const body = await request.json()
       const team = await verifyTeam(db, body.team_code)
@@ -272,8 +288,31 @@ async function handleRoute(request, { params }) {
       const submitted = await db.collection('matches').countDocuments({ status: 'submitted' })
       const disputed = await db.collection('matches').countDocuments({ status: 'disputed' })
       const pendingReqs = await db.collection('player_change_requests').countDocuments({ status: 'pending' })
+      const pendingDates = await db.collection('date_change_requests').countDocuments({ status: 'pending' })
       const recentLogs = (await db.collection('audit_logs').find({}).sort({ ts: -1 }).limit(10).toArray()).map(stripId)
-      return handleCORS(NextResponse.json({ submitted, disputed, pending_change_requests: pendingReqs, recent_logs: recentLogs }))
+      return handleCORS(NextResponse.json({ submitted, disputed, pending_change_requests: pendingReqs, pending_date_requests: pendingDates, recent_logs: recentLogs }))
+    }
+
+    if (route === '/admin/date-change-requests' && method === 'GET') {
+      if (!isAdmin) return handleCORS(NextResponse.json({ error: 'unauthorized' }, { status: 401 }))
+      const all = (await db.collection('date_change_requests').find({}).sort({ ts: -1 }).toArray()).map(stripId)
+      return handleCORS(NextResponse.json(all))
+    }
+
+    if (route.startsWith('/admin/date-change-requests/') && path.length === 4 && method === 'POST') {
+      if (!isAdmin) return handleCORS(NextResponse.json({ error: 'unauthorized' }, { status: 401 }))
+      const id = path[2]; const action = path[3]
+      const req = stripId(await db.collection('date_change_requests').findOne({ id }))
+      if (!req) return handleCORS(NextResponse.json({ error: 'not found' }, { status: 404 }))
+      if (action === 'approve') {
+        await db.collection('matches').updateOne({ id: req.match_id }, { $set: { date: req.new_date } })
+        await db.collection('date_change_requests').updateOne({ id }, { $set: { status: 'approved', decided_at: new Date().toISOString(), decided_by: 'admin' } })
+        await logAudit(db, { actor: 'admin', action: 'date_change_approved', entity: 'match', entity_id: req.match_id, old_value: { date: req.old_date }, new_value: { date: req.new_date } })
+      } else if (action === 'reject') {
+        await db.collection('date_change_requests').updateOne({ id }, { $set: { status: 'rejected', decided_at: new Date().toISOString(), decided_by: 'admin' } })
+        await logAudit(db, { actor: 'admin', action: 'date_change_rejected', entity: 'match', entity_id: req.match_id, old_value: { date: req.old_date }, new_value: { date: req.new_date } })
+      } else return handleCORS(NextResponse.json({ error: 'invalid action' }, { status: 400 }))
+      return handleCORS(NextResponse.json({ ok: true }))
     }
 
     if (route === '/admin/change-requests' && method === 'GET') {
@@ -454,7 +493,13 @@ async function handleRoute(request, { params }) {
       for (const name of TEAM_NAMES) {
         const key = normalize(name)
         const existing = teamByNorm[key]
-        if (existing) { if (existing.name !== name) await db.collection('teams').updateOne({ id: existing.id }, { $set: { name } }); teamIdByName[name] = existing.id }
+        if (existing) {
+          const updates = {}
+          if (existing.name !== name) updates.name = name
+          if (existing.code !== TEAM_CODES[name]) updates.code = TEAM_CODES[name]
+          if (Object.keys(updates).length) await db.collection('teams').updateOne({ id: existing.id }, { $set: updates })
+          teamIdByName[name] = existing.id
+        }
         else { const nt = { id: uuidv4(), name, code: TEAM_CODES[name], season_id: season.id, created_at: new Date().toISOString() }; await db.collection('teams').insertOne(nt); teamIdByName[name] = nt.id }
       }
 
