@@ -20,7 +20,6 @@ const PAGES = [
   { id: 'teams', label: 'Ploegen', icon: Users },
   { id: 'spelers', label: 'Spelers', icon: User },
   { id: 'historiek', label: 'Historiek', icon: History },
-  { id: 'scorebord', label: 'Scorebord', icon: Target },
   { id: 'portaal', label: 'Teamportaal', icon: LogIn },
   { id: 'admin', label: 'Admin', icon: Shield },
 ]
@@ -221,7 +220,7 @@ function MatchDetailDialog({ matchId, onClose }) {
   const [match, setMatch] = useState(null)
   useEffect(() => { if (matchId) api.get(`/matches/${matchId}`).then(setMatch) }, [matchId])
   if (!matchId) return null
-  return (<Dialog open={!!matchId} onOpenChange={(o) => !o && onClose()}><DialogContent className="max-w-2xl"><DialogHeader><DialogTitle>{match ? `${match.home_team_name} vs ${match.away_team_name}` : 'Wedstrijd'}</DialogTitle></DialogHeader>{match && (<div className="space-y-3"><div className="flex items-center justify-between"><div className="text-sm text-muted-foreground">Speeldag {match.week} · {formatDate(match.date)}</div>{statusBadge(match.status)}</div>{['confirmed','admin_approved','submitted','disputed'].includes(match.status) && match.games ? (<><div className="text-center py-3 bg-emerald-50 rounded-lg"><div className="text-3xl font-bold text-emerald-700">{match.points_home} - {match.points_away}</div><div className="text-xs text-muted-foreground mt-1">{match.status==='submitted'?'Voorlopig':'Eindstand'}</div></div><Table><TableHeader><TableRow><TableHead>#</TableHead><TableHead>Type</TableHead><TableHead>Thuis</TableHead><TableHead className="text-center">Sets</TableHead><TableHead>Uit</TableHead></TableRow></TableHeader><TableBody>{match.games.map((g, idx) => { const hn = (g.home_players||[]).map(id => match.home_players.find(p=>p.id===id)?.name).filter(Boolean).join(' & '); const an = (g.away_players||[]).map(id => match.away_players.find(p=>p.id===id)?.name).filter(Boolean).join(' & '); return (<TableRow key={idx}><TableCell>{idx+1}</TableCell><TableCell><Badge variant="outline">{g.type}</Badge></TableCell><TableCell className={g.home_frames>g.away_frames?'font-bold':''}>{hn}</TableCell><TableCell className="text-center font-mono">{g.home_frames}-{g.away_frames}</TableCell><TableCell className={g.away_frames>g.home_frames?'font-bold':''}>{an}</TableCell></TableRow>) })}</TableBody></Table>{match.dispute_reason && <div className="text-sm bg-red-50 p-3 rounded border border-red-200"><strong>Betwist:</strong> {match.dispute_reason}</div>}{match.remarks && <div className="text-sm bg-amber-50 p-3 rounded border border-amber-200"><strong>Opmerkingen:</strong> {match.remarks}</div>}</>) : (<p className="text-sm text-muted-foreground text-center py-6">Wedstrijd nog niet gespeeld.</p>)}</div>)}</DialogContent></Dialog>)
+  return (<Dialog open={!!matchId} onOpenChange={(o) => !o && onClose()}><DialogContent className="max-w-2xl"><DialogHeader><DialogTitle>{match ? `${match.home_team_name} vs ${match.away_team_name}` : 'Wedstrijd'}</DialogTitle></DialogHeader>{match && (<div className="space-y-3"><div className="flex items-center justify-between"><div className="text-sm text-muted-foreground">Speeldag {match.week} · {formatDate(match.date)}</div>{statusBadge(match.status)}</div>{['confirmed','admin_approved','submitted','disputed'].includes(match.status) && match.games ? (<><div className="grid grid-cols-2 gap-3"><div className="text-center py-3 bg-emerald-50 rounded-lg"><div className="text-3xl font-bold text-emerald-700">{match.points_home} - {match.points_away}</div><div className="text-xs text-muted-foreground mt-1">Punten (2-0→3, 2-1→2)</div></div><div className="text-center py-3 bg-blue-50 rounded-lg"><div className="text-3xl font-bold text-blue-700">{(match.games||[]).reduce((a,g)=>a+(Number(g.home_frames)||0),0)} - {(match.games||[]).reduce((a,g)=>a+(Number(g.away_frames)||0),0)}</div><div className="text-xs text-muted-foreground mt-1">Frames (sets gewonnen)</div></div></div><Table><TableHeader><TableRow><TableHead>#</TableHead><TableHead>Type</TableHead><TableHead>Thuis</TableHead><TableHead className="text-center">Sets</TableHead><TableHead>Uit</TableHead></TableRow></TableHeader><TableBody>{match.games.map((g, idx) => { const hn = (g.home_players||[]).map(id => match.home_players.find(p=>p.id===id)?.name).filter(Boolean).join(' & '); const an = (g.away_players||[]).map(id => match.away_players.find(p=>p.id===id)?.name).filter(Boolean).join(' & '); return (<TableRow key={idx}><TableCell>{idx+1}</TableCell><TableCell><Badge variant="outline">{g.type}</Badge></TableCell><TableCell className={g.home_frames>g.away_frames?'font-bold':''}>{hn}</TableCell><TableCell className="text-center font-mono">{g.home_frames}-{g.away_frames}</TableCell><TableCell className={g.away_frames>g.home_frames?'font-bold':''}>{an}</TableCell></TableRow>) })}</TableBody></Table>{match.dispute_reason && <div className="text-sm bg-red-50 p-3 rounded border border-red-200"><strong>Betwist:</strong> {match.dispute_reason}</div>}{match.remarks && <div className="text-sm bg-amber-50 p-3 rounded border border-amber-200"><strong>Opmerkingen:</strong> {match.remarks}</div>}</>) : (<p className="text-sm text-muted-foreground text-center py-6">Wedstrijd nog niet gespeeld.</p>)}</div>)}</DialogContent></Dialog>)
 }
 
 // --------- Team Portal ---------
@@ -339,7 +338,7 @@ function PlayerPicker({ players, multi, value, onChange, matchDate }) {
       if (p.is_placeholder) return false
       if (!p.can_play_from) return true
       return new Date(p.can_play_from) <= md
-    })
+    }).sort((a, b) => a.name.localeCompare(b.name, 'nl', { sensitivity: 'base' }))
   }, [players, matchDate])
   if (!multi) return (<select className="w-full h-10 rounded-md border border-input bg-background px-2 text-sm" value={value[0] || ''} onChange={e => onChange(e.target.value ? [e.target.value] : [])}><option value="">-- Kies speler --</option>{availablePlayers.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select>)
   const toggle = (id) => { if (value.includes(id)) onChange(value.filter(v => v !== id)); else if (value.length < 2) onChange([...value, id]) }
@@ -362,7 +361,7 @@ function AdminDashboard({ adminCode, logout }) {
     if (tab==='dashboard') setDash(await api.get('/admin/dashboard', H))
     if (tab==='requests') setReqs(await api.get('/admin/change-requests', H))
     if (tab==='daterequests') setDateReqs(await api.get('/admin/date-change-requests', H))
-    if (tab==='teams') { setTeams(await api.get('/admin/teams-full', H)); setPlayers(await api.get('/players')) }
+    if (tab==='teams') { setTeams(await api.get('/admin/teams-full', H)); setPlayers(await api.get('/admin/players-full', H)) }
     if (tab==='matches') setMatches(await api.get('/matches'))
     if (tab==='kalender') { setMatches(await api.get('/matches')); setTeams(await api.get('/teams')) }
     if (tab==='logs') setLogs(await api.get('/admin/audit-logs', H))
@@ -400,12 +399,48 @@ const StatCard = ({ icon: Icon, label, val, color }) => (<Card><CardContent clas
 
 function AdminMatches({ matches, adminCode, reload }) {
   const H = { 'x-admin-code': adminCode }
+  const [editMatch, setEditMatch] = useState(null)
   const pending = matches.filter(m => ['submitted','disputed'].includes(m.status))
+  const finished = matches.filter(m => ['confirmed','admin_approved'].includes(m.status))
   const approve = async (id) => { const m = matches.find(x => x.id === id); const r = await api.post(`/admin/matches/${id}/approve`, { games: m.games }, H); if (r.ok) { toast.success('Wedstrijd goedgekeurd'); reload() } }
-  return (<Card><CardHeader><CardTitle>Wedstrijden — actie vereist</CardTitle></CardHeader><CardContent className="space-y-2">
-    {pending.length===0 && <p className="text-sm text-muted-foreground">Geen wedstrijden die actie vereisen.</p>}
-    {pending.map(m => (<div key={m.id} className="flex items-center justify-between border rounded-lg p-3"><div><div className="font-medium">{m.home_team_name} vs {m.away_team_name}</div><div className="text-xs text-muted-foreground">Uitslag: {m.points_home}-{m.points_away} · {statusMap[m.status]?.label}{m.dispute_reason && ` · ${m.dispute_reason}`}</div></div><Button size="sm" className="bg-emerald-600 hover:bg-emerald-700" onClick={() => approve(m.id)}>Goedkeuren als admin</Button></div>))}
-  </CardContent></Card>)
+  return (<div className="space-y-4">
+    <Card><CardHeader><CardTitle>Actie vereist ({pending.length})</CardTitle></CardHeader><CardContent className="space-y-2">
+      {pending.length===0 && <p className="text-sm text-muted-foreground">Geen wedstrijden die actie vereisen.</p>}
+      {pending.map(m => (<div key={m.id} className="flex items-center justify-between border rounded-lg p-3 flex-wrap gap-2"><div><div className="font-medium">{m.home_team_name} vs {m.away_team_name}</div><div className="text-xs text-muted-foreground">Uitslag: {m.points_home}-{m.points_away} · {statusMap[m.status]?.label}{m.dispute_reason && ` · ${m.dispute_reason}`}</div></div><div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => setEditMatch(m)}><Edit3 className="w-3 h-3 mr-1" />Bewerk</Button><Button size="sm" className="bg-emerald-600 hover:bg-emerald-700" onClick={() => approve(m.id)}>Goedkeuren als admin</Button></div></div>))}
+    </CardContent></Card>
+    <Card><CardHeader><CardTitle>Gespeelde wedstrijden ({finished.length})</CardTitle><CardDescription>Admin kan uitslagen aanpassen. Wijzigingen worden gelogd in de audit log.</CardDescription></CardHeader><CardContent className="space-y-2">
+      {finished.map(m => (<div key={m.id} className="flex items-center justify-between border rounded-lg p-3 flex-wrap gap-2"><div><div className="font-medium">{m.home_team_name} vs {m.away_team_name}</div><div className="text-xs text-muted-foreground">{formatDate(m.date)} · Uitslag: {m.points_home}-{m.points_away} · {statusMap[m.status]?.label}</div></div><Button size="sm" variant="outline" onClick={() => setEditMatch(m)}><Edit3 className="w-3 h-3 mr-1" />Bewerk uitslag</Button></div>))}
+      {finished.length===0 && <p className="text-sm text-muted-foreground">Nog geen bevestigde wedstrijden.</p>}
+    </CardContent></Card>
+    {editMatch && (<AdminMatchEditDialog match={editMatch} adminCode={adminCode} onClose={() => setEditMatch(null)} onSaved={() => { setEditMatch(null); reload() }} />)}
+  </div>)
+}
+
+function AdminMatchEditDialog({ match, adminCode, onClose, onSaved }) {
+  const [detail, setDetail] = useState(null)
+  const [games, setGames] = useState(null)
+  const [saving, setSaving] = useState(false)
+  useEffect(() => { api.get(`/matches/${match.id}`).then(d => { setDetail(d); const existing = d.games || GAME_TEMPLATE.map(g => ({ type: g.type, home_players: [], away_players: [], home_frames: 0, away_frames: 0, forfait_home: false, forfait_away: false })); setGames(existing) }) }, [match.id])
+  const updateGame = (idx, field, val) => setGames(gs => gs.map((g, i) => i === idx ? { ...g, [field]: val } : g))
+  const totals = useMemo(() => { if (!games) return {h:0,a:0}; let h=0,a=0; for (const g of games) { const hf=Number(g.home_frames),af=Number(g.away_frames); if (hf===2&&af===0)h+=3; else if (hf===0&&af===2)a+=3; else if (hf===2&&af===1){h+=2;a+=1} else if (hf===1&&af===2){h+=1;a+=2} } return {h,a} }, [games])
+  const save = async () => {
+    for (let i = 0; i < games.length; i++) { const g = games[i]; const need = g.type==='enkel'?1:2
+      if (!g.forfait_home && g.home_players.length !== need) return toast.error(`Selecteer thuis-spelers voor partij ${i+1}`)
+      if (!g.forfait_away && g.away_players.length !== need) return toast.error(`Selecteer uit-spelers voor partij ${i+1}`)
+      const hf=Number(g.home_frames), af=Number(g.away_frames)
+      const valid = (hf===2&&af===0)||(hf===0&&af===2)||(hf===2&&af===1)||(hf===1&&af===2)
+      if (!valid) return toast.error(`Ongeldige set-uitslag partij ${i+1}`)
+    }
+    setSaving(true)
+    const r = await api.post(`/admin/matches/${match.id}/approve`, { games }, { 'x-admin-code': adminCode })
+    setSaving(false)
+    if (r.ok) { toast.success(`Uitslag opgeslagen: ${r.points_home}-${r.points_away}`); onSaved() }
+    else toast.error(r.error || 'Fout')
+  }
+  return (<Dialog open onOpenChange={(o) => !o && onClose()}><DialogContent className="max-w-4xl max-h-[92vh] overflow-y-auto"><DialogHeader><DialogTitle>Admin: wedstrijd bewerken</DialogTitle><DialogDescriptionCompat>{match.home_team_name} vs {match.away_team_name} · {formatDate(match.date)}</DialogDescriptionCompat></DialogHeader>
+    {!detail || !games ? <p>Laden...</p> : (<div className="space-y-3"><div className="text-center bg-blue-600 text-white p-3 rounded-lg"><div className="text-xs opacity-80">Nieuwe stand na opslaan</div><div className="text-3xl font-bold">{totals.h} - {totals.a}</div></div>{GAME_TEMPLATE.map((tpl, idx) => (<div key={idx} className="border rounded-lg p-3"><div className="flex items-center justify-between mb-2"><div className="font-medium">{tpl.label} <Badge variant="outline">{tpl.type}</Badge></div></div><div className="grid md:grid-cols-5 gap-2 items-end"><div className="md:col-span-2"><Label className="text-xs">Thuis</Label><PlayerPicker players={detail.home_players} multi={tpl.type==='dubbel'} value={games[idx].home_players} onChange={(v)=>updateGame(idx,'home_players',v)} matchDate={detail.date} /></div><div><Label className="text-xs">Sets</Label><div className="flex items-center gap-1"><SetSelect value={games[idx].home_frames} onChange={v=>updateGame(idx,'home_frames',v)} /><span>-</span><SetSelect value={games[idx].away_frames} onChange={v=>updateGame(idx,'away_frames',v)} /></div></div><div className="md:col-span-2"><Label className="text-xs">Uit</Label><PlayerPicker players={detail.away_players} multi={tpl.type==='dubbel'} value={games[idx].away_players} onChange={(v)=>updateGame(idx,'away_players',v)} matchDate={detail.date} /></div></div></div>))}</div>)}
+    <DialogFooter><Button variant="outline" onClick={onClose}>Annuleren</Button><Button className="bg-emerald-600 hover:bg-emerald-700" onClick={save} disabled={saving}>{saving?'Opslaan...':'Opslaan als admin'}</Button></DialogFooter>
+  </DialogContent></Dialog>)
 }
 
 function AdminRequests({ reqs, adminCode, reload }) {
@@ -427,6 +462,7 @@ function AdminDateRequests({ reqs, adminCode, reload }) {
 function AdminTeams({ teams, players, adminCode, reload }) {
   const H = { 'x-admin-code': adminCode }
   const [newTeam, setNewTeam] = useState(''); const [newPlayer, setNewPlayer] = useState({ team_id: '', name: '', can_play_from: '' })
+  const [sortBy, setSortBy] = useState('name'); const [sortDir, setSortDir] = useState('asc')
   const addTeam = async () => { if (!newTeam.trim()) return; const r = await api.post('/admin/teams', { name: newTeam }, H); if (r.id) { toast.success(`Ploeg ${r.name} aangemaakt · Code: ${r.code}`); setNewTeam(''); reload() } }
   const delTeam = async (id) => { if (!confirm('Ploeg verwijderen? Alle spelers worden ook verwijderd.')) return; await api.del(`/admin/teams/${id}`, H); toast.success('Ploeg verwijderd'); reload() }
   const resetCode = async (id) => { const r = await api.post(`/admin/teams/${id}/reset-code`, {}, H); if (r.code) { toast.success(`Nieuwe code: ${r.code}`); reload() } }
@@ -438,9 +474,22 @@ function AdminTeams({ teams, players, adminCode, reload }) {
     if (r.id) { toast.success(`Speler toegevoegd · Speelgerechtigd vanaf ${new Date(r.can_play_from).toLocaleDateString('nl-BE')}`); setNewPlayer({ team_id: newPlayer.team_id, name: '', can_play_from: '' }); reload() }
   }
   const delPlayer = async (id) => { if (!confirm('Speler verwijderen?')) return; await api.del(`/admin/players/${id}`, H); toast.success('Speler verwijderd'); reload() }
+  const toggleSort = (key) => { if (sortBy === key) setSortDir(sortDir === 'asc' ? 'desc' : 'asc'); else { setSortBy(key); setSortDir('asc') } }
+  const sortedPlayers = useMemo(() => {
+    const cmp = (a, b) => {
+      let av, bv
+      if (sortBy === 'team') { av = a.team_name || ''; bv = b.team_name || '' }
+      else if (sortBy === 'can_play') { av = a.can_play_from || ''; bv = b.can_play_from || '' }
+      else { av = a.name || ''; bv = b.name || '' }
+      const r = String(av).localeCompare(String(bv), 'nl', { sensitivity: 'base' })
+      return sortDir === 'asc' ? r : -r
+    }
+    return [...players].sort(cmp)
+  }, [players, sortBy, sortDir])
+  const sortIcon = (key) => sortBy === key ? (sortDir === 'asc' ? ' ↑' : ' ↓') : ''
   return (<div className="space-y-4">
     <Card><CardHeader><CardTitle>Ploegen ({teams.length})</CardTitle></CardHeader><CardContent><div className="flex gap-2 mb-3"><Input placeholder="Nieuwe ploegnaam" value={newTeam} onChange={e=>setNewTeam(e.target.value)} /><Button onClick={addTeam} className="bg-emerald-600 hover:bg-emerald-700"><Plus className="w-4 h-4 mr-1" />Toevoegen</Button></div><Table><TableHeader><TableRow><TableHead>Ploeg</TableHead><TableHead>Code</TableHead><TableHead className="text-right">Acties</TableHead></TableRow></TableHeader><TableBody>{teams.map(t => (<TableRow key={t.id}><TableCell className="font-medium">{t.name}</TableCell><TableCell><code className="bg-slate-100 px-2 py-1 rounded text-xs">{t.code}</code></TableCell><TableCell className="text-right"><Button size="sm" variant="outline" className="mr-2" onClick={() => resetCode(t.id)}><RefreshCw className="w-3 h-3 mr-1" />Reset code</Button><Button size="sm" variant="destructive" onClick={() => delTeam(t.id)}><Trash2 className="w-3 h-3" /></Button></TableCell></TableRow>))}</TableBody></Table></CardContent></Card>
-    <Card><CardHeader><CardTitle>Spelers ({players.length})</CardTitle><CardDescription>Nieuwe spelers krijgen standaard 2 maanden wachttijd. Je kan een aangepaste startdatum instellen.</CardDescription></CardHeader><CardContent><div className="grid md:grid-cols-5 gap-2 mb-3 p-3 bg-emerald-50 rounded"><select className="h-10 rounded-md border border-input bg-background px-2 text-sm md:col-span-1" value={newPlayer.team_id} onChange={e=>setNewPlayer({...newPlayer, team_id: e.target.value})}><option value="">-- Kies ploeg --</option>{teams.map(t=>(<option key={t.id} value={t.id}>{t.name}</option>))}</select><Input className="md:col-span-2" placeholder="Nieuwe speler" value={newPlayer.name} onChange={e=>setNewPlayer({...newPlayer, name: e.target.value})} /><Input type="date" title="Speelgerechtigd vanaf" value={newPlayer.can_play_from} onChange={e=>setNewPlayer({...newPlayer, can_play_from: e.target.value})} placeholder="Speelgerechtigd vanaf" /><Button onClick={addPlayer} className="bg-emerald-600 hover:bg-emerald-700"><Plus className="w-4 h-4 mr-1" />Toevoegen</Button></div><Table><TableHeader><TableRow><TableHead>Speler</TableHead><TableHead>Ploeg</TableHead><TableHead>Speelgerechtigd</TableHead><TableHead className="text-right">Acties</TableHead></TableRow></TableHeader><TableBody>{players.map(p => { const cpf = p.can_play_from ? new Date(p.can_play_from) : null; const notYet = cpf && cpf > new Date(); return (<TableRow key={p.player_id}><TableCell className="font-medium">{p.name}</TableCell><TableCell className="text-muted-foreground">{p.team_name}</TableCell><TableCell className="text-xs">{cpf ? (<span className={notYet?'text-amber-700 font-semibold':'text-emerald-700'}>{notYet ? `Vanaf ${cpf.toLocaleDateString('nl-BE')}` : 'Ja'}</span>) : '—'}</TableCell><TableCell className="text-right"><Button size="sm" variant="destructive" onClick={() => delPlayer(p.player_id)}><Trash2 className="w-3 h-3" /></Button></TableCell></TableRow>) })}</TableBody></Table></CardContent></Card>
+    <Card><CardHeader><CardTitle>Spelers ({players.length})</CardTitle><CardDescription>Klik op de kolomkop om te sorteren. Placeholder-spelers ("Speler te kort") worden ook getoond.</CardDescription></CardHeader><CardContent><div className="grid md:grid-cols-5 gap-2 mb-3 p-3 bg-emerald-50 rounded"><select className="h-10 rounded-md border border-input bg-background px-2 text-sm md:col-span-1" value={newPlayer.team_id} onChange={e=>setNewPlayer({...newPlayer, team_id: e.target.value})}><option value="">-- Kies ploeg --</option>{teams.map(t=>(<option key={t.id} value={t.id}>{t.name}</option>))}</select><Input className="md:col-span-2" placeholder="Nieuwe speler" value={newPlayer.name} onChange={e=>setNewPlayer({...newPlayer, name: e.target.value})} /><Input type="date" title="Speelgerechtigd vanaf" value={newPlayer.can_play_from} onChange={e=>setNewPlayer({...newPlayer, can_play_from: e.target.value})} /><Button onClick={addPlayer} className="bg-emerald-600 hover:bg-emerald-700"><Plus className="w-4 h-4 mr-1" />Toevoegen</Button></div><Table><TableHeader><TableRow><TableHead className="cursor-pointer select-none" onClick={()=>toggleSort('name')}>Speler{sortIcon('name')}</TableHead><TableHead className="cursor-pointer select-none" onClick={()=>toggleSort('team')}>Ploeg{sortIcon('team')}</TableHead><TableHead className="cursor-pointer select-none" onClick={()=>toggleSort('can_play')}>Speelgerechtigd{sortIcon('can_play')}</TableHead><TableHead className="text-right">Acties</TableHead></TableRow></TableHeader><TableBody>{sortedPlayers.map(p => { const cpf = p.can_play_from ? new Date(p.can_play_from) : null; const notYet = cpf && cpf > new Date(); return (<TableRow key={p.player_id} className={p.is_placeholder ? 'bg-slate-50' : ''}><TableCell className="font-medium">{p.name}{p.is_placeholder && <Badge className="ml-2 bg-slate-300 text-slate-800 text-[10px]">Placeholder</Badge>}</TableCell><TableCell className="text-muted-foreground">{p.team_name}</TableCell><TableCell className="text-xs">{cpf ? (<span className={notYet?'text-amber-700 font-semibold':'text-emerald-700'}>{notYet ? `Vanaf ${cpf.toLocaleDateString('nl-BE')}` : cpf.toLocaleDateString('nl-BE')}</span>) : '—'}</TableCell><TableCell className="text-right"><Button size="sm" variant="destructive" onClick={() => delPlayer(p.player_id)}><Trash2 className="w-3 h-3" /></Button></TableCell></TableRow>) })}</TableBody></Table></CardContent></Card>
   </div>)
 }
 
@@ -492,7 +541,6 @@ function App() {
     {page === 'teams' && <TeamsPage teams={teams} onOpen={setTeamDialog} />}
     {page === 'spelers' && <SpelersPage players={players} teams={teams} />}
     {page === 'historiek' && <HistoriekPage />}
-    {page === 'scorebord' && <ScorebordPage />}
     {page === 'portaal' && <TeamPortal session={session} setSession={(s)=>{ setSession(s); if (s) load() }} />}
     {page === 'admin' && <AdminPortal adminCode={adminCode} setAdminCode={setAdminCode} />}
     {teamDialog && <TeamDetailDialog teamId={teamDialog} onClose={() => setTeamDialog(null)} />}

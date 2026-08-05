@@ -413,6 +413,13 @@ async function handleRoute(request, { params }) {
       const teams = (await db.collection('teams').find({}).toArray()).map(stripId)
       return handleCORS(NextResponse.json(teams))
     }
+    if (route === '/admin/players-full' && method === 'GET') {
+      if (!isAdmin) return handleCORS(NextResponse.json({ error: 'unauthorized' }, { status: 401 }))
+      const players = (await db.collection('players').find({}).toArray()).map(stripId)
+      const teams = (await db.collection('teams').find({}).toArray()).map(stripId)
+      const tmap = Object.fromEntries(teams.map(t => [t.id, t.name]))
+      return handleCORS(NextResponse.json(players.map(p => ({ player_id: p.id, name: p.name, team_id: p.team_id, team_name: tmap[p.team_id] || '', can_play_from: p.can_play_from || null, joined_at: p.joined_at || null, is_placeholder: !!p.is_placeholder, active: p.active !== false }))))
+    }
 
     // Admin players CRUD
     if (route === '/admin/players' && method === 'POST') {
