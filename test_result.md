@@ -178,6 +178,110 @@ backend:
         agent: "testing"
         comment: "All existing endpoints working. GET /api/teams returns 6 teams. GET /api/standings returns 6 entries. GET /api/matches returns 38 matches. POST /api/auth/team with TEL-4928 returns team+players+matches. POST /api/auth/admin returns ok:true. GET /api/admin/dashboard includes pending_date_requests field. Date change request flow (create + approve) works correctly and updates match date."
 
+  - task: "Session-2 Fix: GET /api/standings defensive recompute from games"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Modified computeStandings to defensively recompute points_for and points_against from match games instead of using stored points_home/points_away. Added points_for, points_against, saldo columns to standings. Framebalans = frames_won - frames_lost, saldo = points_for - points_against."
+      - working: true
+        agent: "testing"
+        comment: "Defensive recompute working correctly. All 6 teams returned with required fields (team_name, played, won, drawn, lost, points_for, points_against, saldo, frames_won, frames_lost, framebalans, comp_points). Framebalans and saldo calculations verified correct. Points_for internally consistent with match games - tested 4 confirmed matches, all teams' points_for match sum of game points."
+
+  - task: "Session-2 Fix: GET /api/players filtering non-speelgerechtigd players"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Modified computePlayerStats to: 1) Skip stats for matches before player.can_play_from date, 2) Filter out players with is_placeholder=true, 3) Filter out players with future can_play_from AND played=0 games. Players with future can_play_from but with legitimate games (played before can_play_from) still appear with only those games counted."
+      - working: true
+        agent: "testing"
+        comment: "Player filtering working correctly. Returns 62 players. No placeholders in public /api/players list (is_placeholder=true filtered out). No players with future can_play_from and 0 games (correctly filtered). Players with future can_play_from but with legitimate games would still appear as expected."
+
+  - task: "Session-2 Fix: End-to-end scoring verification"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Verified scoring logic: 2-0 → 3-0 points, 2-1 → 2-1 points. Match submission and confirmation flow. Standings update with correct points_for, frames_won, comp_points."
+      - working: true
+        agent: "testing"
+        comment: "End-to-end scoring test passed. Match De Sportwereld vs Den Telstar: submitted 10 games all 2-0 home wins, confirmed by away team. Match points correct: 30-0 (comp punten). Frames correct: 20-0 (sets). Standings updated correctly: home points_for +30 (3→33), frames_won +20 (3→23), comp_points +3 (0→3); away frames_lost +20 (4→24)."
+
+  - task: "Session-2 Fix: POST /api/admin/players with future can_play_from"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "POST /api/admin/players accepts custom can_play_from date. If provided, uses that date exactly; otherwise defaults to joined_at + 2 months."
+      - working: true
+        agent: "testing"
+        comment: "Future player filtering working correctly. Created test player 'Toekomst Test Speler' with can_play_from=2030-01-01. Player NOT in public /api/players (correctly filtered due to future date + 0 games). Player found in admin /api/admin/players-full (correctly included). Test player deleted (cleanup)."
+
+  - task: "Session-2 Fix: Regression checks"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Verified all existing endpoints still working after session-2 fixes."
+      - working: true
+        agent: "testing"
+        comment: "All regression checks passed. GET /api/teams returns 6 teams. POST /api/auth/admin returns ok:true, token:ADMIN-9999. POST /api/auth/team returns all required fields (team, players, matches, change_requests, date_change_requests, incoming_date_requests). GET /api/admin/dashboard returns all required fields (submitted, disputed, pending_change_requests, pending_date_requests, recent_logs). POST /api/admin/setup-2026-2027 returns ok:true (idempotent). GET /api/admin/audit-logs returns array of 76 log entries."
+
+
+  - agent: "user"
+    message: |
+      NEW BUG REPORT (session 2):
+      1. Wedstrijdblad totalen (30-0 max) verward: gebruiker denkt max 20; feitelijk zijn dit COMP PUNTEN (2-0→3, 2-1→2/1) niet frames.
+      2. Klassement: gebruiker verwachtte "Arena +57 -3" wat de PUNTEN VOOR/TEGEN som is (57 vs 3), maar klassement toonde alleen Fr+/Fr- (39/3). => Fix: kolommen Pt+/Pt-/Saldo TOEGEVOEGD naast Fr+/Fr-.
+      3. Admin match edit dialog toont geen spelers geselecteerd voor confirmed matches wanneer die spelers placeholder of niet-speelgerechtigd zijn. => Fix: PlayerPicker toont nu ook already-selected spelers ongeacht filter.
+      4. Bij spelersklassement stonden 2 spelers met punten die niet speelgerechtigd zijn. => Fix: computePlayerStats slaat stats over voor matches vóór player.can_play_from; en filtert niet-speelgerechtigde spelers met 0 games uit lijst.
+      5. computeStandings herrekent nu points_for uit games (defensief) i.p.v. gestorde m.points_home.
+
+  - agent: "main"
+    message: |
+      Applied 5 targeted fixes for session-2 bug report. Please re-run backend tests:
+      1. GET /api/standings — verify Arena has points_for=57, points_against=3, frames_won=39, frames_lost=3, comp_points=6, played=2 (given existing test data)
+      2. Simulate: submit match where all 10 games are 2-0 home wins → verify points_home=30 (comp punten) and sum(home_frames)=20 (frames)
+      3. PlayerPicker fix is frontend-only, no backend impact
+      4. GET /api/players — verify that no player with can_play_from > NOW appears in list (unless they played matches before their can_play_from, in which case stats are only from those matches — the future can_play_from should not add points from matches that happened after but were mis-recorded)
+      5. Regression: /api/admin/players-full still returns all incl. placeholders
+  - agent: "testing"
+    message: |
+      Session-2 backend testing completed. All 5 tests PASSED:
+      ✅ GET /api/standings - defensive recompute from games working correctly (all 6 teams, correct calculations, points_for internally consistent)
+      ✅ GET /api/players - filtering working (no placeholders, no future can_play_from with 0 games)
+      ✅ End-to-end scoring - match submitted/confirmed, points 30-0, frames 20-0, standings updated correctly
+      ✅ Future player filtering - correctly filtered from public API, visible in admin API
+      ✅ All regression checks passed (teams, auth, dashboard, setup-2026-2027, audit-logs)
+      
+      Backend is fully functional with no major issues found.
+
 frontend:
   - task: "Remove Scorebord page/nav"
     implemented: true
@@ -230,13 +334,11 @@ frontend:
 metadata:
   created_by: "main_agent"
   version: "1.0"
-  test_sequence: 2
+  test_sequence: 3
   run_ui: false
 
 test_plan:
-  current_focus:
-    - "GET /api/admin/players-full - new endpoint returning all players incl. placeholders for admin view"
-    - "POST /api/admin/matches/:id/approve - allows admin to edit confirmed matches"
+  current_focus: []
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"

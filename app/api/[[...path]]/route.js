@@ -95,21 +95,27 @@ async function logAudit(db, entry) {
 async function computeStandings(db) {
   const teams = (await db.collection('teams').find({}).toArray()).map(stripId)
   const matches = (await db.collection('matches').find({ status: { $in: ['confirmed', 'admin_approved'] } }).toArray()).map(stripId)
+  const rules = await getScoring(db)
   const stats = {}
   for (const t of teams) stats[t.id] = { team_id: t.id, team_name: t.name, played: 0, won: 0, lost: 0, drawn: 0, points_for: 0, points_against: 0, frames_won: 0, frames_lost: 0, framebalans: 0, saldo: 0, comp_points: 0, total_points: 0 }
   for (const m of matches) {
-    if (!m.games) continue
+    if (!m.games || !Array.isArray(m.games) || m.games.length === 0) continue
     const s = stats[m.home_team_id], s2 = stats[m.away_team_id]; if (!s || !s2) continue
-    s.played += 1; s2.played += 1
-    s.points_for += m.points_home; s.points_against += m.points_away
-    s2.points_for += m.points_away; s2.points_against += m.points_home
+    // Recompute points and frames from games (defensive - ignore stored points_home/away)
+    let ph = 0, pa = 0, fh = 0, fa = 0
     for (const g of m.games) {
       const hf = Number(g.home_frames) || 0, af = Number(g.away_frames) || 0
-      s.frames_won += hf; s.frames_lost += af
-      s2.frames_won += af; s2.frames_lost += hf
+      const pts = pointsForFrames(hf, af, rules)
+      ph += pts.home; pa += pts.away
+      fh += hf; fa += af
     }
-    if (m.points_home > m.points_away) { s.won += 1; s.comp_points += 3; s2.lost += 1 }
-    else if (m.points_home < m.points_away) { s2.won += 1; s2.comp_points += 3; s.lost += 1 }
+    s.played += 1; s2.played += 1
+    s.points_for += ph; s.points_against += pa
+    s2.points_for += pa; s2.points_against += ph
+    s.frames_won += fh; s.frames_lost += fa
+    s2.frames_won += fa; s2.frames_lost += fh
+    if (ph > pa) { s.won += 1; s.comp_points += 3; s2.lost += 1 }
+    else if (ph < pa) { s2.won += 1; s2.comp_points += 3; s.lost += 1 }
     else { s.drawn += 1; s2.drawn += 1; s.comp_points += 1; s2.comp_points += 1 }
   }
   for (const id in stats) { stats[id].framebalans = stats[id].frames_won - stats[id].frames_lost; stats[id].saldo = stats[id].points_for - stats[id].points_against; stats[id].total_points = stats[id].comp_points }
@@ -121,19 +127,44 @@ async function computePlayerStats(db) {
   const tmap = Object.fromEntries(teams.map(t => [t.id, t.name]))
   const rules = await getScoring(db)
   const matches = (await db.collection('matches').find({ status: { $in: ['confirmed', 'admin_approved'] } }).toArray()).map(stripId)
+  const now = new Date()
   const stats = {}
   for (const p of players) stats[p.id] = { player_id: p.id, name: p.name, team_id: p.team_id, team_name: tmap[p.team_id] || '', is_placeholder: !!p.is_placeholder, can_play_from: p.can_play_from || null, joined_at: p.joined_at || null, played: 0, won: 0, lost: 0, enkel_played: 0, enkel_won: 0, enkel_frames_won: 0, enkel_frames_lost: 0, enkel_points: 0, dubbel_played: 0, dubbel_won: 0, dubbel_frames_won: 0, dubbel_frames_lost: 0, dubbel_points: 0, points: 0 }
+  const playerMap = Object.fromEntries(players.map(p => [p.id, p]))
   for (const m of matches) {
     if (!m.games) continue
+    const matchDate = m.date ? new Date(m.date) : null
     for (const g of m.games) {
       const pts = pointsForFrames(g.home_frames, g.away_frames, rules)
       const homeWon = pts.home > pts.away, awayWon = pts.away > pts.home
       const hf = Number(g.home_frames) || 0, af = Number(g.away_frames) || 0
-      for (const pid of g.home_players || []) { const s = stats[pid]; if (!s) continue; s.played += 1; s.points += pts.home; if (homeWon) s.won += 1; else if (awayWon) s.lost += 1; if (g.type === 'enkel') { s.enkel_played += 1; s.enkel_points += pts.home; s.enkel_frames_won += hf; s.enkel_frames_lost += af; if (homeWon) s.enkel_won += 1 } else { s.dubbel_played += 1; s.dubbel_points += pts.home; s.dubbel_frames_won += hf; s.dubbel_frames_lost += af; if (homeWon) s.dubbel_won += 1 } }
-      for (const pid of g.away_players || []) { const s = stats[pid]; if (!s) continue; s.played += 1; s.points += pts.away; if (awayWon) s.won += 1; else if (homeWon) s.lost += 1; if (g.type === 'enkel') { s.enkel_played += 1; s.enkel_points += pts.away; s.enkel_frames_won += af; s.enkel_frames_lost += hf; if (awayWon) s.enkel_won += 1 } else { s.dubbel_played += 1; s.dubbel_points += pts.away; s.dubbel_frames_won += af; s.dubbel_frames_lost += hf; if (awayWon) s.dubbel_won += 1 } }
+      for (const pid of g.home_players || []) {
+        const s = stats[pid]; if (!s) continue
+        // Only count stats if player was speelgerechtigd at match date
+        const p = playerMap[pid]
+        if (p && p.can_play_from && matchDate && new Date(p.can_play_from) > matchDate) continue
+        s.played += 1; s.points += pts.home
+        if (homeWon) s.won += 1; else if (awayWon) s.lost += 1
+        if (g.type === 'enkel') { s.enkel_played += 1; s.enkel_points += pts.home; s.enkel_frames_won += hf; s.enkel_frames_lost += af; if (homeWon) s.enkel_won += 1 }
+        else { s.dubbel_played += 1; s.dubbel_points += pts.home; s.dubbel_frames_won += hf; s.dubbel_frames_lost += af; if (homeWon) s.dubbel_won += 1 }
+      }
+      for (const pid of g.away_players || []) {
+        const s = stats[pid]; if (!s) continue
+        const p = playerMap[pid]
+        if (p && p.can_play_from && matchDate && new Date(p.can_play_from) > matchDate) continue
+        s.played += 1; s.points += pts.away
+        if (awayWon) s.won += 1; else if (homeWon) s.lost += 1
+        if (g.type === 'enkel') { s.enkel_played += 1; s.enkel_points += pts.away; s.enkel_frames_won += af; s.enkel_frames_lost += hf; if (awayWon) s.enkel_won += 1 }
+        else { s.dubbel_played += 1; s.dubbel_points += pts.away; s.dubbel_frames_won += af; s.dubbel_frames_lost += hf; if (awayWon) s.dubbel_won += 1 }
+      }
     }
   }
-  return Object.values(stats).filter(s => !s.is_placeholder).map(s => { const tfw = s.enkel_frames_won + s.dubbel_frames_won; const tfl = s.enkel_frames_lost + s.dubbel_frames_lost; return { ...s, total_frames_won: tfw, total_frames_lost: tfl, framebalans: tfw - tfl, win_pct: s.played ? Math.round((s.won / s.played) * 100) : 0 } }).sort((a, b) => b.points - a.points || b.total_frames_won - a.total_frames_won || b.framebalans - a.framebalans || a.name.localeCompare(b.name))
+  // Filter out placeholders AND players who are not yet speelgerechtigd (future can_play_from) AND have no legit played games
+  return Object.values(stats).filter(s => {
+    if (s.is_placeholder) return false
+    if (s.can_play_from && new Date(s.can_play_from) > now && s.played === 0) return false
+    return true
+  }).map(s => { const tfw = s.enkel_frames_won + s.dubbel_frames_won; const tfl = s.enkel_frames_lost + s.dubbel_frames_lost; return { ...s, total_frames_won: tfw, total_frames_lost: tfl, framebalans: tfw - tfl, win_pct: s.played ? Math.round((s.won / s.played) * 100) : 0 } }).sort((a, b) => b.points - a.points || b.total_frames_won - a.total_frames_won || b.framebalans - a.framebalans || a.name.localeCompare(b.name))
 }
 
 // -------- Auth helpers --------
