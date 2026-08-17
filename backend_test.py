@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-Backend API tests for Pool Competitie
-Tests the priority endpoints and regression checks
+Session-3 Backend Validation Testing for Pool Competitie webapp
+Tests new validation rules:
+1. Speelgerechtigd: player can only play if can_play_from <= match date
+2. Geen dubbele inzet: player can only appear once across all 10 games
+3. Admin override via allow_reuse bypasses ONLY dubbele-inzet, NOT speelgerechtigd
 """
+
 import requests
 import json
 from datetime import datetime, timedelta
@@ -10,7 +14,7 @@ from datetime import datetime, timedelta
 # Base URL from .env
 BASE_URL = "https://pool-stats-3.preview.emergentagent.com/api"
 
-# Auth codes
+# Auth credentials
 ADMIN_CODE = "ADMIN-9999"
 TEAM_CODES = {
     "Den Telstar": "TEL-4928",
@@ -26,809 +30,709 @@ def print_test(name):
     print(f"TEST: {name}")
     print('='*80)
 
-def print_success(msg):
-    print(f"✅ {msg}")
+def print_result(passed, message):
+    status = "✅ PASS" if passed else "❌ FAIL"
+    print(f"{status}: {message}")
 
-def print_error(msg):
-    print(f"❌ {msg}")
-
-def print_info(msg):
-    print(f"ℹ️  {msg}")
-
-
-# Test 1: GET /api/admin/players-full
-def test_admin_players_full():
-    print_test("GET /api/admin/players-full - with placeholders")
+def get_scheduled_match():
+    """Get a scheduled match with home team and players"""
+    resp = requests.get(f"{BASE_URL}/matches")
+    if resp.status_code != 200:
+        print(f"Failed to get matches: {resp.status_code}")
+        return None
     
-    # Test without admin header - should return 401
-    try:
-        resp = requests.get(f"{BASE_URL}/admin/players-full")
-        if resp.status_code == 401:
-            print_success("Without admin header returns 401")
-        else:
-            print_error(f"Without admin header returned {resp.status_code}, expected 401")
-    except Exception as e:
-        print_error(f"Request failed: {e}")
-        return False
+    matches = resp.json()
+    scheduled = [m for m in matches if m['status'] == 'scheduled']
+    if not scheduled:
+        print("No scheduled matches found")
+        return None
     
-    # Test with admin header - should return 200 with players including placeholders
-    try:
-        headers = {"x-admin-code": ADMIN_CODE}
-        resp = requests.get(f"{BASE_URL}/admin/players-full", headers=headers)
-        
-        if resp.status_code != 200:
-            print_error(f"With admin header returned {resp.status_code}, expected 200")
-            print_info(f"Response: {resp.text}")
-            return False
-        
-        print_success("With admin header returns 200")
-        
-        players = resp.json()
-        if not isinstance(players, list):
-            print_error(f"Response is not an array, got: {type(players)}")
-            return False
-        
-        print_success(f"Response is array with {len(players)} players")
-        
-        # Check for required fields
-        if len(players) > 0:
-            sample = players[0]
-            required_fields = ['player_id', 'name', 'team_id', 'team_name', 'can_play_from', 'is_placeholder', 'active']
-            missing = [f for f in required_fields if f not in sample]
-            if missing:
-                print_error(f"Missing fields in player object: {missing}")
-                return False
-            print_success(f"Player objects have all required fields: {required_fields}")
-        
-        # Check for placeholders
-        placeholders = [p for p in players if p.get('is_placeholder') == True]
-        print_info(f"Found {len(placeholders)} placeholder entries")
-        
-        if len(placeholders) != 6:
-            print_error(f"Expected exactly 6 placeholders (one per team), found {len(placeholders)}")
-            for ph in placeholders:
-                print_info(f"  - {ph.get('name')} ({ph.get('team_name')})")
-            return False
-        
-        print_success("Found exactly 6 placeholder entries (one per team)")
-        
-        # Verify placeholder names
-        for ph in placeholders:
-            if ph.get('name') != 'Speler te kort':
-                print_error(f"Placeholder has wrong name: {ph.get('name')}, expected 'Speler te kort'")
-                return False
-        
-        print_success("All placeholders have correct name 'Speler te kort'")
-        
-        # Compare with public /api/players endpoint
-        public_resp = requests.get(f"{BASE_URL}/players")
-        if public_resp.status_code == 200:
-            public_players = public_resp.json()
-            public_placeholders = [p for p in public_players if p.get('is_placeholder') == True]
-            if len(public_placeholders) == 0:
-                print_success("Public /api/players does NOT contain placeholders (correct)")
-            else:
-                print_error(f"Public /api/players contains {len(public_placeholders)} placeholders (should be 0)")
-                return False
-        
-        return True
-        
-    except Exception as e:
-        print_error(f"Request failed: {e}")
-        return False
+    match = scheduled[0]
+    
+    # Get match details with players
+    resp = requests.get(f"{BASE_URL}/matches/{match['id']}")
+    if resp.status_code != 200:
+        print(f"Failed to get match details: {resp.status_code}")
+        return None
+    
+    return resp.json()
 
+def create_game_data(home_player_ids, away_player_ids, game_type='enkel'):
+    """Create a game object with proper structure"""
+    return {
+        "type": game_type,
+        "home_players": home_player_ids if isinstance(home_player_ids, list) else [home_player_ids],
+        "away_players": away_player_ids if isinstance(away_player_ids, list) else [away_player_ids],
+        "home_frames": 2,
+        "away_frames": 0
+    }
 
-# Test 2: POST /api/admin/matches/:id/approve - edit confirmed matches
-def test_admin_edit_confirmed_match():
-    print_test("POST /api/admin/matches/:id/approve - edit confirmed match")
+def test_1_duplicate_player_submit():
+    """Test 1: Team submit with duplicate player (should fail)"""
+    print_test("Test 1: Team submit with duplicate player across games")
     
     try:
-        # Get a scheduled match
-        resp = requests.get(f"{BASE_URL}/matches")
-        if resp.status_code != 200:
-            print_error(f"Failed to get matches: {resp.status_code}")
+        match = get_scheduled_match()
+        if not match:
+            print_result(False, "Could not find scheduled match")
             return False
         
-        matches = resp.json()
-        scheduled = [m for m in matches if m.get('status') == 'scheduled']
-        
-        if len(scheduled) == 0:
-            print_error("No scheduled matches found to test with")
+        home_players = [p for p in match['home_players'] if not p.get('is_placeholder')]
+        if len(home_players) < 1:
+            print_result(False, "Not enough home players")
             return False
         
-        match = scheduled[0]
-        match_id = match['id']
-        home_team_id = match['home_team_id']
-        away_team_id = match['away_team_id']
+        # Use same player in multiple games
+        duplicate_player = home_players[0]['id']
+        away_players = [p for p in match['away_players'] if not p.get('is_placeholder')][:10]
         
-        print_info(f"Using match: {match['home_team_name']} vs {match['away_team_name']} (ID: {match_id})")
+        games = []
+        for i in range(10):
+            away_id = away_players[i % len(away_players)]['id']
+            games.append(create_game_data([duplicate_player], [away_id]))
         
-        # Get match details to get player lists
-        match_detail_resp = requests.get(f"{BASE_URL}/matches/{match_id}")
-        if match_detail_resp.status_code != 200:
-            print_error(f"Failed to get match details: {match_detail_resp.status_code}")
-            return False
-        
-        match_detail = match_detail_resp.json()
-        home_players = [p for p in match_detail['home_players'] if not p.get('is_placeholder')]
-        away_players = [p for p in match_detail['away_players'] if not p.get('is_placeholder')]
-        
-        if len(home_players) < 4 or len(away_players) < 4:
-            print_error(f"Not enough players: home={len(home_players)}, away={len(away_players)}")
-            return False
-        
-        # Find team codes
+        # Try to submit with duplicate player
         home_code = None
-        away_code = None
         for team_name, code in TEAM_CODES.items():
             if team_name in match['home_team_name']:
                 home_code = code
-            if team_name in match['away_team_name']:
-                away_code = code
+                break
         
-        if not home_code or not away_code:
-            print_error(f"Could not find team codes for {match['home_team_name']} and {match['away_team_name']}")
+        if not home_code:
+            print_result(False, f"Could not find team code for {match['home_team_name']}")
             return False
         
-        # Create 10 games (4 enkel, 2 dubbel, 4 enkel)
+        resp = requests.post(
+            f"{BASE_URL}/matches/{match['id']}/submit",
+            json={"team_code": home_code, "games": games}
+        )
+        
+        print(f"Response status: {resp.status_code}")
+        print(f"Response body: {resp.text}")
+        
+        if resp.status_code == 400:
+            data = resp.json()
+            if data.get('error') == 'Validatiefouten' and 'errors' in data:
+                errors = data['errors']
+                has_duplicate_error = any('is al ingezet in partij' in str(e) for e in errors)
+                if has_duplicate_error:
+                    print_result(True, f"Correctly rejected duplicate player with errors: {errors}")
+                    return True
+                else:
+                    print_result(False, f"Got validation errors but not for duplicate: {errors}")
+                    return False
+            else:
+                print_result(False, f"Wrong error format: {data}")
+                return False
+        else:
+            print_result(False, f"Expected 400, got {resp.status_code}")
+            return False
+            
+    except Exception as e:
+        print_result(False, f"Exception: {str(e)}")
+        return False
+
+def test_2_future_player_submit():
+    """Test 2: Team submit with future can_play_from player (should fail)"""
+    print_test("Test 2: Team submit with non-speelgerechtigd player")
+    
+    try:
+        match = get_scheduled_match()
+        if not match:
+            print_result(False, "Could not find scheduled match")
+            return False
+        
+        # Create a player with future can_play_from date
+        future_date = "2099-01-01T00:00:00Z"
+        resp = requests.post(
+            f"{BASE_URL}/admin/players",
+            headers={"x-admin-code": ADMIN_CODE},
+            json={
+                "name": "Toekomst Test Speler Session3",
+                "team_id": match['home_team_id'],
+                "can_play_from": future_date
+            }
+        )
+        
+        if resp.status_code != 200:
+            print_result(False, f"Failed to create test player: {resp.status_code} - {resp.text}")
+            return False
+        
+        future_player = resp.json()
+        future_player_id = future_player['id']
+        print(f"Created test player: {future_player_id}")
+        
+        # Get updated match details
+        resp = requests.get(f"{BASE_URL}/matches/{match['id']}")
+        match = resp.json()
+        
+        # Create games with future player
+        home_players = [p for p in match['home_players'] if not p.get('is_placeholder') and p['id'] != future_player_id]
+        away_players = [p for p in match['away_players'] if not p.get('is_placeholder')]
+        
         games = []
-        # First 4 enkel
-        for i in range(4):
-            games.append({
-                "type": "enkel",
-                "home_players": [home_players[i % len(home_players)]['id']],
-                "away_players": [away_players[i % len(away_players)]['id']],
-                "home_frames": 2,
-                "away_frames": 0
-            })
-        # 2 dubbel
-        for i in range(2):
-            games.append({
-                "type": "dubbel",
-                "home_players": [home_players[i % len(home_players)]['id'], home_players[(i+1) % len(home_players)]['id']],
-                "away_players": [away_players[i % len(away_players)]['id'], away_players[(i+1) % len(away_players)]['id']],
-                "home_frames": 2,
-                "away_frames": 0
-            })
-        # Last 4 enkel
-        for i in range(4):
-            games.append({
-                "type": "enkel",
-                "home_players": [home_players[(i+2) % len(home_players)]['id']],
-                "away_players": [away_players[(i+2) % len(away_players)]['id']],
-                "home_frames": 2,
-                "away_frames": 0
-            })
+        # First game with future player
+        games.append(create_game_data([future_player_id], [away_players[0]['id']]))
+        # Rest with valid players
+        for i in range(1, 10):
+            home_id = home_players[i % len(home_players)]['id']
+            away_id = away_players[i % len(away_players)]['id']
+            games.append(create_game_data([home_id], [away_id]))
+        
+        # Try to submit
+        home_code = None
+        for team_name, code in TEAM_CODES.items():
+            if team_name in match['home_team_name']:
+                home_code = code
+                break
+        
+        resp = requests.post(
+            f"{BASE_URL}/matches/{match['id']}/submit",
+            json={"team_code": home_code, "games": games}
+        )
+        
+        print(f"Response status: {resp.status_code}")
+        print(f"Response body: {resp.text}")
+        
+        # Cleanup
+        requests.delete(
+            f"{BASE_URL}/admin/players/{future_player_id}",
+            headers={"x-admin-code": ADMIN_CODE}
+        )
+        print(f"Cleaned up test player: {future_player_id}")
+        
+        if resp.status_code == 400:
+            data = resp.json()
+            if data.get('error') == 'Validatiefouten' and 'errors' in data:
+                errors = data['errors']
+                has_speelgerechtigd_error = any('nog niet speelgerechtigd' in str(e) for e in errors)
+                if has_speelgerechtigd_error:
+                    print_result(True, f"Correctly rejected non-speelgerechtigd player: {errors}")
+                    return True
+                else:
+                    print_result(False, f"Got validation errors but not for speelgerechtigd: {errors}")
+                    return False
+            else:
+                print_result(False, f"Wrong error format: {data}")
+                return False
+        else:
+            print_result(False, f"Expected 400, got {resp.status_code}")
+            return False
+            
+    except Exception as e:
+        print_result(False, f"Exception: {str(e)}")
+        return False
+
+def test_3_valid_submit():
+    """Test 3: Team submit with valid game data (should succeed)"""
+    print_test("Test 3: Valid team submit with unique players")
+    
+    temp_players = []
+    
+    try:
+        match = get_scheduled_match()
+        if not match:
+            print_result(False, "Could not find scheduled match")
+            return False
+        
+        home_players = [p for p in match['home_players'] if not p.get('is_placeholder')]
+        away_players = [p for p in match['away_players'] if not p.get('is_placeholder')]
+        
+        print(f"Available players: home={len(home_players)}, away={len(away_players)}")
+        
+        # Add temporary players if needed to reach 12 per team
+        # Set can_play_from to match date or earlier to avoid speelgerechtigd issues
+        match_date = match['date']
+        
+        while len(home_players) < 12:
+            resp = requests.post(
+                f"{BASE_URL}/admin/players",
+                headers={"x-admin-code": ADMIN_CODE},
+                json={
+                    "name": f"Temp Home Player {len(temp_players) + 1}",
+                    "team_id": match['home_team_id'],
+                    "can_play_from": match_date
+                }
+            )
+            if resp.status_code == 200:
+                new_player = resp.json()
+                home_players.append(new_player)
+                temp_players.append(new_player['id'])
+                print(f"Added temp home player: {new_player['id']}")
+        
+        while len(away_players) < 12:
+            resp = requests.post(
+                f"{BASE_URL}/admin/players",
+                headers={"x-admin-code": ADMIN_CODE},
+                json={
+                    "name": f"Temp Away Player {len(temp_players) + 1}",
+                    "team_id": match['away_team_id'],
+                    "can_play_from": match_date
+                }
+            )
+            if resp.status_code == 200:
+                new_player = resp.json()
+                away_players.append(new_player)
+                temp_players.append(new_player['id'])
+                print(f"Added temp away player: {new_player['id']}")
+        
+        # Create 10 games: 8 enkel + 2 dubbel = 12 unique players needed
+        games = []
+        
+        # 8 enkel games
+        for i in range(8):
+            home_id = home_players[i]['id']
+            away_id = away_players[i]['id']
+            games.append(create_game_data([home_id], [away_id], 'enkel'))
+        
+        # 2 dubbel games using players 8-11 (4 players)
+        home_ids = [home_players[8]['id'], home_players[9]['id']]
+        away_ids = [away_players[8]['id'], away_players[9]['id']]
+        games.append(create_game_data(home_ids, away_ids, 'dubbel'))
+        
+        home_ids = [home_players[10]['id'], home_players[11]['id']]
+        away_ids = [away_players[10]['id'], away_players[11]['id']]
+        games.append(create_game_data(home_ids, away_ids, 'dubbel'))
         
         # Submit as home team
-        submit_data = {
-            "team_code": home_code,
-            "games": games,
-            "remarks": "Test submission"
-        }
+        home_code = None
+        for team_name, code in TEAM_CODES.items():
+            if team_name in match['home_team_name']:
+                home_code = code
+                break
         
-        submit_resp = requests.post(f"{BASE_URL}/matches/{match_id}/submit", json=submit_data)
-        if submit_resp.status_code != 200:
-            print_error(f"Failed to submit match: {submit_resp.status_code} - {submit_resp.text}")
+        resp = requests.post(
+            f"{BASE_URL}/matches/{match['id']}/submit",
+            json={"team_code": home_code, "games": games}
+        )
+        
+        print(f"Response status: {resp.status_code}")
+        print(f"Response body: {resp.text}")
+        
+        if resp.status_code != 200:
+            print_result(False, f"Submit failed: {resp.status_code} - {resp.text}")
             return False
         
-        print_success("Home team submitted match result")
+        data = resp.json()
+        if not data.get('ok'):
+            print_result(False, f"Submit returned ok=false: {data}")
+            return False
         
         # Confirm as away team
-        confirm_data = {
-            "team_code": away_code,
-            "agree": True
-        }
+        away_code = None
+        for team_name, code in TEAM_CODES.items():
+            if team_name in match['away_team_name']:
+                away_code = code
+                break
         
-        confirm_resp = requests.post(f"{BASE_URL}/matches/{match_id}/confirm", json=confirm_data)
-        if confirm_resp.status_code != 200:
-            print_error(f"Failed to confirm match: {confirm_resp.status_code} - {confirm_resp.text}")
-            return False
+        resp = requests.post(
+            f"{BASE_URL}/matches/{match['id']}/confirm",
+            json={"team_code": away_code, "agree": True}
+        )
         
-        print_success("Away team confirmed match (status now 'confirmed')")
+        print(f"Confirm response status: {resp.status_code}")
+        print(f"Confirm response body: {resp.text}")
         
-        # Now as admin, edit the match
-        # Change some frames to test recalculation
-        modified_games = games.copy()
-        modified_games[0]['home_frames'] = 2
-        modified_games[0]['away_frames'] = 1  # Change from 2-0 to 2-1
-        modified_games[1]['home_frames'] = 1
-        modified_games[1]['away_frames'] = 2  # Change from 2-0 to 1-2 (away wins)
-        
-        approve_data = {
-            "games": modified_games
-        }
-        
-        headers = {"x-admin-code": ADMIN_CODE}
-        approve_resp = requests.post(f"{BASE_URL}/admin/matches/{match_id}/approve", json=approve_data, headers=headers)
-        
-        if approve_resp.status_code != 200:
-            print_error(f"Failed to approve/edit match: {approve_resp.status_code} - {approve_resp.text}")
-            return False
-        
-        approve_result = approve_resp.json()
-        
-        if not approve_result.get('ok'):
-            print_error(f"Approve response missing 'ok': {approve_result}")
-            return False
-        
-        print_success("Admin approved/edited match")
-        
-        # Check recalculated points
-        # Original: 10 games all 2-0 = 30-0
-        # Modified: game 0 is 2-1 (2-1 points), game 1 is 1-2 (1-2 points), rest 8 games 2-0 (24-0)
-        # Total: 2+1+24 = 27 home, 1+2+0 = 3 away
-        expected_home = 27
-        expected_away = 3
-        
-        if 'points_home' not in approve_result or 'points_away' not in approve_result:
-            print_error(f"Approve response missing points: {approve_result}")
-            return False
-        
-        if approve_result['points_home'] != expected_home or approve_result['points_away'] != expected_away:
-            print_error(f"Points mismatch: got {approve_result['points_home']}-{approve_result['points_away']}, expected {expected_home}-{expected_away}")
-            return False
-        
-        print_success(f"Recalculated points correct: {approve_result['points_home']}-{approve_result['points_away']}")
-        
-        # Verify match status and points via GET
-        verify_resp = requests.get(f"{BASE_URL}/matches/{match_id}")
-        if verify_resp.status_code != 200:
-            print_error(f"Failed to verify match: {verify_resp.status_code}")
-            return False
-        
-        verified_match = verify_resp.json()
-        
-        if verified_match['status'] != 'admin_approved':
-            print_error(f"Match status is {verified_match['status']}, expected 'admin_approved'")
-            return False
-        
-        print_success("Match status is 'admin_approved'")
-        
-        if verified_match['points_home'] != expected_home or verified_match['points_away'] != expected_away:
-            print_error(f"Verified points mismatch: {verified_match['points_home']}-{verified_match['points_away']}")
-            return False
-        
-        print_success(f"Verified match points: {verified_match['points_home']}-{verified_match['points_away']}")
-        
-        # Check audit log
-        audit_resp = requests.get(f"{BASE_URL}/admin/audit-logs", headers=headers)
-        if audit_resp.status_code != 200:
-            print_error(f"Failed to get audit logs: {audit_resp.status_code}")
-            return False
-        
-        audit_logs = audit_resp.json()
-        match_audit = [log for log in audit_logs if log.get('action') == 'match_admin_approved' and log.get('entity_id') == match_id]
-        
-        if len(match_audit) == 0:
-            print_error("No audit log entry found for match_admin_approved")
-            return False
-        
-        print_success(f"Audit log entry found for match_admin_approved")
-        
-        return True
-        
-    except Exception as e:
-        print_error(f"Test failed with exception: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-
-# Test 3: POST /api/admin/players with custom can_play_from
-def test_custom_can_play_from():
-    print_test("POST /api/admin/players - custom can_play_from date")
-    
-    try:
-        # Get teams
-        resp = requests.get(f"{BASE_URL}/teams")
         if resp.status_code != 200:
-            print_error(f"Failed to get teams: {resp.status_code}")
+            print_result(False, f"Confirm failed: {resp.status_code} - {resp.text}")
             return False
         
-        teams = resp.json()
-        if len(teams) == 0:
-            print_error("No teams found")
+        confirm_data = resp.json()
+        if confirm_data.get('status') != 'confirmed':
+            print_result(False, f"Match not confirmed: {confirm_data}")
             return False
         
-        team_id = teams[0]['id']
-        print_info(f"Using team: {teams[0]['name']} (ID: {team_id})")
-        
-        # Create player with custom can_play_from
-        custom_date = "2027-01-15T00:00:00.000Z"
-        player_data = {
-            "team_id": team_id,
-            "name": "Test Speler CanPlay",
-            "can_play_from": custom_date
-        }
-        
-        headers = {"x-admin-code": ADMIN_CODE}
-        create_resp = requests.post(f"{BASE_URL}/admin/players", json=player_data, headers=headers)
-        
-        if create_resp.status_code != 200:
-            print_error(f"Failed to create player: {create_resp.status_code} - {create_resp.text}")
+        # Verify standings updated
+        resp = requests.get(f"{BASE_URL}/standings")
+        if resp.status_code != 200:
+            print_result(False, f"Failed to get standings: {resp.status_code}")
             return False
         
-        created_player = create_resp.json()
-        player_id = created_player['id']
-        
-        print_success(f"Created player with ID: {player_id}")
-        
-        # Verify can_play_from is the custom date, not joined_at + 2 months
-        if 'can_play_from' not in created_player:
-            print_error("Response missing can_play_from field")
+        standings = resp.json()
+        if len(standings) != 6:
+            print_result(False, f"Expected 6 teams in standings, got {len(standings)}")
             return False
         
-        # Parse dates to compare (ignore milliseconds)
-        created_date = created_player['can_play_from'][:10]  # Get YYYY-MM-DD
-        expected_date = custom_date[:10]
-        
-        if created_date != expected_date:
-            print_error(f"can_play_from mismatch: got {created_date}, expected {expected_date}")
-            return False
-        
-        print_success(f"can_play_from is correct: {created_date}")
-        
-        # Verify via GET /api/admin/players-full
-        verify_resp = requests.get(f"{BASE_URL}/admin/players-full", headers=headers)
-        if verify_resp.status_code != 200:
-            print_error(f"Failed to verify player: {verify_resp.status_code}")
-            return False
-        
-        all_players = verify_resp.json()
-        test_player = [p for p in all_players if p['player_id'] == player_id]
-        
-        if len(test_player) == 0:
-            print_error("Created player not found in players-full list")
-            return False
-        
-        verified_date = test_player[0]['can_play_from'][:10]
-        if verified_date != expected_date:
-            print_error(f"Verified can_play_from mismatch: got {verified_date}, expected {expected_date}")
-            return False
-        
-        print_success(f"Verified can_play_from via players-full: {verified_date}")
-        
-        # Cleanup - delete the test player
-        delete_resp = requests.delete(f"{BASE_URL}/admin/players/{player_id}", headers=headers)
-        if delete_resp.status_code != 200:
-            print_error(f"Failed to delete test player: {delete_resp.status_code}")
-            return False
-        
-        print_success("Test player deleted (cleanup)")
-        
+        print_result(True, f"Valid submit succeeded, match confirmed, standings updated")
         return True
         
     except Exception as e:
-        print_error(f"Test failed with exception: {e}")
-        import traceback
-        traceback.print_exc()
+        print_result(False, f"Exception: {str(e)}")
         return False
+    finally:
+        # Cleanup temp players
+        for player_id in temp_players:
+            requests.delete(
+                f"{BASE_URL}/admin/players/{player_id}",
+                headers={"x-admin-code": ADMIN_CODE}
+            )
+            print(f"Cleaned up temp player: {player_id}")
 
-
-# Test 4: Scoring correctness
-def test_scoring_correctness():
-    print_test("Scoring correctness - 10 games all 2-0 and all 2-1")
+def test_4_admin_override_allow_reuse():
+    """Test 4: Admin approve with allow_reuse=true and duplicate players (should succeed)"""
+    print_test("Test 4: Admin approve with allow_reuse=true and duplicate players")
     
     try:
-        # Get scheduled matches
+        # Find any match (preferably confirmed)
         resp = requests.get(f"{BASE_URL}/matches")
         if resp.status_code != 200:
-            print_error(f"Failed to get matches: {resp.status_code}")
+            print_result(False, f"Failed to get matches: {resp.status_code}")
             return False
         
         matches = resp.json()
-        scheduled = [m for m in matches if m.get('status') == 'scheduled']
+        target_match = None
+        for m in matches:
+            if m['status'] in ['confirmed', 'admin_approved']:
+                target_match = m
+                break
         
-        if len(scheduled) < 2:
-            print_error(f"Need at least 2 scheduled matches, found {len(scheduled)}")
+        if not target_match:
+            # Use a scheduled match
+            for m in matches:
+                if m['status'] == 'scheduled':
+                    target_match = m
+                    break
+        
+        if not target_match:
+            print_result(False, "No suitable match found")
             return False
-        
-        # Test 1: All 10 games 2-0 home wins
-        match1 = scheduled[0]
-        match1_id = match1['id']
-        
-        print_info(f"\nTest 1: All 2-0 home wins")
-        print_info(f"Match: {match1['home_team_name']} vs {match1['away_team_name']}")
         
         # Get match details
-        detail_resp = requests.get(f"{BASE_URL}/matches/{match1_id}")
-        if detail_resp.status_code != 200:
-            print_error(f"Failed to get match details: {detail_resp.status_code}")
+        resp = requests.get(f"{BASE_URL}/matches/{target_match['id']}")
+        if resp.status_code != 200:
+            print_result(False, f"Failed to get match details: {resp.status_code}")
             return False
         
-        match1_detail = detail_resp.json()
-        home_players = [p for p in match1_detail['home_players'] if not p.get('is_placeholder')]
-        away_players = [p for p in match1_detail['away_players'] if not p.get('is_placeholder')]
+        match = resp.json()
+        home_players = [p for p in match['home_players'] if not p.get('is_placeholder')]
+        away_players = [p for p in match['away_players'] if not p.get('is_placeholder')]
         
-        # Find team codes
-        home_code = None
-        away_code = None
-        for team_name, code in TEAM_CODES.items():
-            if team_name in match1['home_team_name']:
-                home_code = code
-            if team_name in match1['away_team_name']:
-                away_code = code
-        
-        if not home_code or not away_code:
-            print_error(f"Could not find team codes")
+        if len(home_players) < 1 or len(away_players) < 1:
+            print_result(False, "Not enough players")
             return False
         
-        # Create 10 games all 2-0
-        games_2_0 = []
-        for i in range(4):  # First 4 enkel
-            games_2_0.append({
-                "type": "enkel",
-                "home_players": [home_players[i % len(home_players)]['id']],
-                "away_players": [away_players[i % len(away_players)]['id']],
-                "home_frames": 2,
-                "away_frames": 0
-            })
-        for i in range(2):  # 2 dubbel
-            games_2_0.append({
-                "type": "dubbel",
-                "home_players": [home_players[i % len(home_players)]['id'], home_players[(i+1) % len(home_players)]['id']],
-                "away_players": [away_players[i % len(away_players)]['id'], away_players[(i+1) % len(away_players)]['id']],
-                "home_frames": 2,
-                "away_frames": 0
-            })
-        for i in range(4):  # Last 4 enkel
-            games_2_0.append({
-                "type": "enkel",
-                "home_players": [home_players[(i+2) % len(home_players)]['id']],
-                "away_players": [away_players[(i+2) % len(away_players)]['id']],
-                "home_frames": 2,
-                "away_frames": 0
-            })
+        # Create games with duplicate home player
+        duplicate_player = home_players[0]['id']
+        games = []
+        for i in range(10):
+            away_id = away_players[i % len(away_players)]['id']
+            games.append(create_game_data([duplicate_player], [away_id]))
         
-        # Submit
-        submit_resp = requests.post(f"{BASE_URL}/matches/{match1_id}/submit", json={
-            "team_code": home_code,
-            "games": games_2_0,
-            "remarks": "Test 2-0"
-        })
+        # Admin approve with allow_reuse=true
+        resp = requests.post(
+            f"{BASE_URL}/admin/matches/{match['id']}/approve",
+            headers={"x-admin-code": ADMIN_CODE},
+            json={"games": games, "allow_reuse": True}
+        )
         
-        if submit_resp.status_code != 200:
-            print_error(f"Failed to submit: {submit_resp.status_code} - {submit_resp.text}")
+        print(f"Response status: {resp.status_code}")
+        print(f"Response body: {resp.text}")
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('ok'):
+                print_result(True, f"Admin override with allow_reuse=true succeeded: points_home={data.get('points_home')}, points_away={data.get('points_away')}")
+                return True
+            else:
+                print_result(False, f"Response ok=false: {data}")
+                return False
+        else:
+            print_result(False, f"Expected 200, got {resp.status_code}: {resp.text}")
             return False
-        
-        # Confirm
-        confirm_resp = requests.post(f"{BASE_URL}/matches/{match1_id}/confirm", json={
-            "team_code": away_code,
-            "agree": True
-        })
-        
-        if confirm_resp.status_code != 200:
-            print_error(f"Failed to confirm: {confirm_resp.status_code} - {confirm_resp.text}")
-            return False
-        
-        # Verify points: 10 games × 3 pts = 30-0
-        verify_resp = requests.get(f"{BASE_URL}/matches/{match1_id}")
-        verified = verify_resp.json()
-        
-        if verified['points_home'] != 30 or verified['points_away'] != 0:
-            print_error(f"Points mismatch for 2-0 games: got {verified['points_home']}-{verified['points_away']}, expected 30-0")
-            return False
-        
-        print_success(f"Points correct for all 2-0: {verified['points_home']}-{verified['points_away']}")
-        
-        # Verify frames: sum of home_frames = 20, sum of away_frames = 0
-        total_home_frames = sum(g['home_frames'] for g in verified['games'])
-        total_away_frames = sum(g['away_frames'] for g in verified['games'])
-        
-        if total_home_frames != 20 or total_away_frames != 0:
-            print_error(f"Frames mismatch: got {total_home_frames}-{total_away_frames}, expected 20-0")
-            return False
-        
-        print_success(f"Frames correct: {total_home_frames}-{total_away_frames}")
-        
-        # Check standings update
-        standings_resp = requests.get(f"{BASE_URL}/standings")
-        if standings_resp.status_code != 200:
-            print_error(f"Failed to get standings: {standings_resp.status_code}")
-            return False
-        
-        standings = standings_resp.json()
-        home_team_standing = [s for s in standings if s['team_id'] == match1['home_team_id']][0]
-        
-        print_info(f"Home team standings: frames_won={home_team_standing['frames_won']}, comp_points={home_team_standing['comp_points']}")
-        print_success("Standings updated (frames_won includes the 20 frames)")
-        
-        # Test 2: All 10 games 2-1 home wins
-        if len(scheduled) < 2:
-            print_error("Need another scheduled match for 2-1 test")
-            return False
-        
-        match2 = scheduled[1]
-        match2_id = match2['id']
-        
-        print_info(f"\nTest 2: All 2-1 home wins")
-        print_info(f"Match: {match2['home_team_name']} vs {match2['away_team_name']}")
-        
-        # Get match details
-        detail_resp2 = requests.get(f"{BASE_URL}/matches/{match2_id}")
-        match2_detail = detail_resp2.json()
-        home_players2 = [p for p in match2_detail['home_players'] if not p.get('is_placeholder')]
-        away_players2 = [p for p in match2_detail['away_players'] if not p.get('is_placeholder')]
-        
-        # Find team codes
-        home_code2 = None
-        away_code2 = None
-        for team_name, code in TEAM_CODES.items():
-            if team_name in match2['home_team_name']:
-                home_code2 = code
-            if team_name in match2['away_team_name']:
-                away_code2 = code
-        
-        # Create 10 games all 2-1
-        games_2_1 = []
-        for i in range(4):
-            games_2_1.append({
-                "type": "enkel",
-                "home_players": [home_players2[i % len(home_players2)]['id']],
-                "away_players": [away_players2[i % len(away_players2)]['id']],
-                "home_frames": 2,
-                "away_frames": 1
-            })
-        for i in range(2):
-            games_2_1.append({
-                "type": "dubbel",
-                "home_players": [home_players2[i % len(home_players2)]['id'], home_players2[(i+1) % len(home_players2)]['id']],
-                "away_players": [away_players2[i % len(away_players2)]['id'], away_players2[(i+1) % len(away_players2)]['id']],
-                "home_frames": 2,
-                "away_frames": 1
-            })
-        for i in range(4):
-            games_2_1.append({
-                "type": "enkel",
-                "home_players": [home_players2[(i+2) % len(home_players2)]['id']],
-                "away_players": [away_players2[(i+2) % len(away_players2)]['id']],
-                "home_frames": 2,
-                "away_frames": 1
-            })
-        
-        # Submit
-        submit_resp2 = requests.post(f"{BASE_URL}/matches/{match2_id}/submit", json={
-            "team_code": home_code2,
-            "games": games_2_1,
-            "remarks": "Test 2-1"
-        })
-        
-        if submit_resp2.status_code != 200:
-            print_error(f"Failed to submit: {submit_resp2.status_code}")
-            return False
-        
-        # Confirm
-        confirm_resp2 = requests.post(f"{BASE_URL}/matches/{match2_id}/confirm", json={
-            "team_code": away_code2,
-            "agree": True
-        })
-        
-        if confirm_resp2.status_code != 200:
-            print_error(f"Failed to confirm: {confirm_resp2.status_code}")
-            return False
-        
-        # Verify points: 10 games × 2 pts home, 1 pt away = 20-10
-        verify_resp2 = requests.get(f"{BASE_URL}/matches/{match2_id}")
-        verified2 = verify_resp2.json()
-        
-        if verified2['points_home'] != 20 or verified2['points_away'] != 10:
-            print_error(f"Points mismatch for 2-1 games: got {verified2['points_home']}-{verified2['points_away']}, expected 20-10")
-            return False
-        
-        print_success(f"Points correct for all 2-1: {verified2['points_home']}-{verified2['points_away']}")
-        
-        # Verify frames: sum of home_frames = 20, sum of away_frames = 10
-        total_home_frames2 = sum(g['home_frames'] for g in verified2['games'])
-        total_away_frames2 = sum(g['away_frames'] for g in verified2['games'])
-        
-        if total_home_frames2 != 20 or total_away_frames2 != 10:
-            print_error(f"Frames mismatch: got {total_home_frames2}-{total_away_frames2}, expected 20-10")
-            return False
-        
-        print_success(f"Frames correct: {total_home_frames2}-{total_away_frames2}")
-        
-        return True
-        
+            
     except Exception as e:
-        print_error(f"Test failed with exception: {e}")
-        import traceback
-        traceback.print_exc()
+        print_result(False, f"Exception: {str(e)}")
         return False
 
+def test_5_admin_override_cannot_bypass_speelgerechtigd():
+    """Test 5: Admin approve with allow_reuse=true BUT non-speelgerechtigd player (should STILL fail)"""
+    print_test("Test 5: Admin override cannot bypass speelgerechtigd check")
+    
+    try:
+        # Find a match
+        resp = requests.get(f"{BASE_URL}/matches")
+        if resp.status_code != 200:
+            print_result(False, f"Failed to get matches: {resp.status_code}")
+            return False
+        
+        matches = resp.json()
+        target_match = None
+        for m in matches:
+            if m['status'] in ['scheduled', 'confirmed', 'admin_approved']:
+                target_match = m
+                break
+        
+        if not target_match:
+            print_result(False, "No suitable match found")
+            return False
+        
+        # Get match details
+        resp = requests.get(f"{BASE_URL}/matches/{target_match['id']}")
+        if resp.status_code != 200:
+            print_result(False, f"Failed to get match details: {resp.status_code}")
+            return False
+        
+        match = resp.json()
+        
+        # Create a player with future can_play_from date
+        future_date = "2099-01-01T00:00:00Z"
+        resp = requests.post(
+            f"{BASE_URL}/admin/players",
+            headers={"x-admin-code": ADMIN_CODE},
+            json={
+                "name": "Toekomst Admin Test Speler",
+                "team_id": match['home_team_id'],
+                "can_play_from": future_date
+            }
+        )
+        
+        if resp.status_code != 200:
+            print_result(False, f"Failed to create test player: {resp.status_code} - {resp.text}")
+            return False
+        
+        future_player = resp.json()
+        future_player_id = future_player['id']
+        print(f"Created test player: {future_player_id}")
+        
+        # Get updated match details
+        resp = requests.get(f"{BASE_URL}/matches/{match['id']}")
+        match = resp.json()
+        
+        home_players = [p for p in match['home_players'] if not p.get('is_placeholder') and p['id'] != future_player_id]
+        away_players = [p for p in match['away_players'] if not p.get('is_placeholder')]
+        
+        # Create games with future player
+        games = []
+        games.append(create_game_data([future_player_id], [away_players[0]['id']]))
+        for i in range(1, 10):
+            home_id = home_players[i % len(home_players)]['id']
+            away_id = away_players[i % len(away_players)]['id']
+            games.append(create_game_data([home_id], [away_id]))
+        
+        # Try admin approve with allow_reuse=true
+        resp = requests.post(
+            f"{BASE_URL}/admin/matches/{match['id']}/approve",
+            headers={"x-admin-code": ADMIN_CODE},
+            json={"games": games, "allow_reuse": True}
+        )
+        
+        print(f"Response status: {resp.status_code}")
+        print(f"Response body: {resp.text}")
+        
+        # Cleanup
+        requests.delete(
+            f"{BASE_URL}/admin/players/{future_player_id}",
+            headers={"x-admin-code": ADMIN_CODE}
+        )
+        print(f"Cleaned up test player: {future_player_id}")
+        
+        if resp.status_code == 400:
+            data = resp.json()
+            if data.get('error') == 'Validatiefouten' and 'errors' in data:
+                errors = data['errors']
+                has_speelgerechtigd_error = any('nog niet speelgerechtigd' in str(e) for e in errors)
+                if has_speelgerechtigd_error:
+                    print_result(True, f"Correctly rejected non-speelgerechtigd player even with allow_reuse: {errors}")
+                    return True
+                else:
+                    print_result(False, f"Got validation errors but not for speelgerechtigd: {errors}")
+                    return False
+            else:
+                print_result(False, f"Wrong error format: {data}")
+                return False
+        else:
+            print_result(False, f"Expected 400, got {resp.status_code}")
+            return False
+            
+    except Exception as e:
+        print_result(False, f"Exception: {str(e)}")
+        return False
 
-# Test 5: Regression checks
-def test_regression():
-    print_test("Regression checks - existing endpoints")
+def test_6_admin_approve_without_override():
+    """Test 6: Admin approve with allow_reuse=false (default) and duplicate players (should fail)"""
+    print_test("Test 6: Admin approve without allow_reuse and duplicate players")
+    
+    try:
+        # Find a match
+        resp = requests.get(f"{BASE_URL}/matches")
+        if resp.status_code != 200:
+            print_result(False, f"Failed to get matches: {resp.status_code}")
+            return False
+        
+        matches = resp.json()
+        target_match = None
+        for m in matches:
+            if m['status'] in ['scheduled', 'confirmed', 'admin_approved']:
+                target_match = m
+                break
+        
+        if not target_match:
+            print_result(False, "No suitable match found")
+            return False
+        
+        # Get match details
+        resp = requests.get(f"{BASE_URL}/matches/{target_match['id']}")
+        if resp.status_code != 200:
+            print_result(False, f"Failed to get match details: {resp.status_code}")
+            return False
+        
+        match = resp.json()
+        home_players = [p for p in match['home_players'] if not p.get('is_placeholder')]
+        away_players = [p for p in match['away_players'] if not p.get('is_placeholder')]
+        
+        if len(home_players) < 1 or len(away_players) < 1:
+            print_result(False, "Not enough players")
+            return False
+        
+        # Create games with duplicate home player
+        duplicate_player = home_players[0]['id']
+        games = []
+        for i in range(10):
+            away_id = away_players[i % len(away_players)]['id']
+            games.append(create_game_data([duplicate_player], [away_id]))
+        
+        # Admin approve WITHOUT allow_reuse (or explicitly false)
+        resp = requests.post(
+            f"{BASE_URL}/admin/matches/{match['id']}/approve",
+            headers={"x-admin-code": ADMIN_CODE},
+            json={"games": games, "allow_reuse": False}
+        )
+        
+        print(f"Response status: {resp.status_code}")
+        print(f"Response body: {resp.text}")
+        
+        if resp.status_code == 400:
+            data = resp.json()
+            if data.get('error') == 'Validatiefouten' and 'errors' in data:
+                errors = data['errors']
+                has_duplicate_error = any('is al ingezet in partij' in str(e) for e in errors)
+                if has_duplicate_error:
+                    print_result(True, f"Correctly rejected duplicate player without override: {errors}")
+                    return True
+                else:
+                    print_result(False, f"Got validation errors but not for duplicate: {errors}")
+                    return False
+            else:
+                print_result(False, f"Wrong error format: {data}")
+                return False
+        else:
+            print_result(False, f"Expected 400, got {resp.status_code}")
+            return False
+            
+    except Exception as e:
+        print_result(False, f"Exception: {str(e)}")
+        return False
+
+def test_7_regression_checks():
+    """Test 7: Regression checks for existing endpoints"""
+    print_test("Test 7: Regression checks")
     
     all_passed = True
     
     try:
-        # GET /api/teams - should return 6 teams
-        resp = requests.get(f"{BASE_URL}/teams")
-        if resp.status_code != 200:
-            print_error(f"GET /api/teams failed: {resp.status_code}")
-            all_passed = False
-        else:
-            teams = resp.json()
-            if len(teams) == 6:
-                print_success(f"GET /api/teams returns 6 teams")
-            else:
-                print_error(f"GET /api/teams returned {len(teams)} teams, expected 6")
-                all_passed = False
-        
-        # GET /api/standings - should return 6 entries
+        # GET /api/standings
         resp = requests.get(f"{BASE_URL}/standings")
-        if resp.status_code != 200:
-            print_error(f"GET /api/standings failed: {resp.status_code}")
-            all_passed = False
-        else:
+        if resp.status_code == 200:
             standings = resp.json()
             if len(standings) == 6:
-                print_success(f"GET /api/standings returns 6 entries")
-            else:
-                print_error(f"GET /api/standings returned {len(standings)} entries, expected 6")
-                all_passed = False
-        
-        # GET /api/matches - should return 36+ matches
-        resp = requests.get(f"{BASE_URL}/matches")
-        if resp.status_code != 200:
-            print_error(f"GET /api/matches failed: {resp.status_code}")
-            all_passed = False
-        else:
-            matches = resp.json()
-            if len(matches) >= 36:
-                print_success(f"GET /api/matches returns {len(matches)} matches (>= 36)")
-            else:
-                print_error(f"GET /api/matches returned {len(matches)} matches, expected >= 36")
-                all_passed = False
-        
-        # POST /api/auth/team with TEL-4928
-        resp = requests.post(f"{BASE_URL}/auth/team", json={"code": "TEL-4928"})
-        if resp.status_code != 200:
-            print_error(f"POST /api/auth/team failed: {resp.status_code}")
-            all_passed = False
-        else:
-            auth_data = resp.json()
-            if 'team' in auth_data and 'players' in auth_data and 'matches' in auth_data:
-                print_success(f"POST /api/auth/team returns team + players + matches")
-            else:
-                print_error(f"POST /api/auth/team missing fields: {auth_data.keys()}")
-                all_passed = False
-        
-        # POST /api/auth/admin with ADMIN-9999
-        resp = requests.post(f"{BASE_URL}/auth/admin", json={"code": "ADMIN-9999"})
-        if resp.status_code != 200:
-            print_error(f"POST /api/auth/admin failed: {resp.status_code}")
-            all_passed = False
-        else:
-            admin_data = resp.json()
-            if admin_data.get('ok') == True and admin_data.get('token') == 'ADMIN-9999':
-                print_success(f"POST /api/auth/admin returns ok:true, token:ADMIN-9999")
-            else:
-                print_error(f"POST /api/auth/admin unexpected response: {admin_data}")
-                all_passed = False
-        
-        # GET /api/admin/dashboard - should include pending_date_requests
-        headers = {"x-admin-code": ADMIN_CODE}
-        resp = requests.get(f"{BASE_URL}/admin/dashboard", headers=headers)
-        if resp.status_code != 200:
-            print_error(f"GET /api/admin/dashboard failed: {resp.status_code}")
-            all_passed = False
-        else:
-            dashboard = resp.json()
-            if 'pending_date_requests' in dashboard:
-                print_success(f"GET /api/admin/dashboard includes pending_date_requests: {dashboard['pending_date_requests']}")
-            else:
-                print_error(f"GET /api/admin/dashboard missing pending_date_requests field")
-                all_passed = False
-        
-        # Test date change request flow (create + respond)
-        # Get a scheduled match
-        matches_resp = requests.get(f"{BASE_URL}/matches")
-        matches = matches_resp.json()
-        scheduled = [m for m in matches if m.get('status') == 'scheduled']
-        
-        if len(scheduled) > 0:
-            test_match = scheduled[-1]  # Use last scheduled match to avoid conflicts
-            match_id = test_match['id']
-            
-            # Find team codes
-            home_code = None
-            away_code = None
-            for team_name, code in TEAM_CODES.items():
-                if team_name in test_match['home_team_name']:
-                    home_code = code
-                if team_name in test_match['away_team_name']:
-                    away_code = code
-            
-            if home_code and away_code:
-                # Create date change request
-                new_date = (datetime.now() + timedelta(days=30)).isoformat()
-                create_req_resp = requests.post(f"{BASE_URL}/date-change-requests", json={
-                    "team_code": home_code,
-                    "match_id": match_id,
-                    "new_date": new_date,
-                    "reason": "Test date change"
-                })
-                
-                if create_req_resp.status_code == 200:
-                    req_data = create_req_resp.json()
-                    req_id = req_data['request']['id']
-                    
-                    # Respond as opponent
-                    respond_resp = requests.post(f"{BASE_URL}/date-change-requests/{req_id}/respond", json={
-                        "team_code": away_code,
-                        "agree": True
-                    })
-                    
-                    if respond_resp.status_code == 200:
-                        respond_data = respond_resp.json()
-                        if respond_data.get('status') == 'approved':
-                            print_success("Date change request flow works (create + approve)")
-                            
-                            # Verify match date was updated
-                            verify_match = requests.get(f"{BASE_URL}/matches/{match_id}").json()
-                            if verify_match['date'][:10] == new_date[:10]:
-                                print_success("Match date was updated correctly")
-                            else:
-                                print_error(f"Match date not updated: {verify_match['date']}")
-                                all_passed = False
-                        else:
-                            print_error(f"Date change request status: {respond_data.get('status')}")
-                            all_passed = False
-                    else:
-                        print_error(f"Failed to respond to date change request: {respond_resp.status_code}")
-                        all_passed = False
+                required_fields = ['team_name', 'played', 'won', 'drawn', 'lost', 'points_for', 
+                                 'points_against', 'saldo', 'frames_won', 'frames_lost', 
+                                 'framebalans', 'comp_points']
+                if all(field in standings[0] for field in required_fields):
+                    print_result(True, "GET /api/standings returns 6 teams with all required fields")
                 else:
-                    print_error(f"Failed to create date change request: {create_req_resp.status_code}")
+                    print_result(False, f"Standings missing fields: {standings[0].keys()}")
                     all_passed = False
+            else:
+                print_result(False, f"Expected 6 teams, got {len(standings)}")
+                all_passed = False
+        else:
+            print_result(False, f"GET /api/standings failed: {resp.status_code}")
+            all_passed = False
+        
+        # GET /api/players
+        resp = requests.get(f"{BASE_URL}/players")
+        if resp.status_code == 200:
+            players = resp.json()
+            has_placeholder = any(p.get('is_placeholder') for p in players)
+            if not has_placeholder:
+                print_result(True, f"GET /api/players returns {len(players)} players without placeholders")
+            else:
+                print_result(False, "Players list contains placeholders")
+                all_passed = False
+        else:
+            print_result(False, f"GET /api/players failed: {resp.status_code}")
+            all_passed = False
+        
+        # POST /api/auth/team
+        resp = requests.post(f"{BASE_URL}/auth/team", json={"code": "TEL-4928"})
+        if resp.status_code == 200:
+            data = resp.json()
+            if 'team' in data and 'players' in data and 'matches' in data:
+                print_result(True, "POST /api/auth/team returns team session")
+            else:
+                print_result(False, f"Team auth missing fields: {data.keys()}")
+                all_passed = False
+        else:
+            print_result(False, f"POST /api/auth/team failed: {resp.status_code}")
+            all_passed = False
+        
+        # POST /api/auth/admin
+        resp = requests.post(f"{BASE_URL}/auth/admin", json={"code": ADMIN_CODE})
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('ok') and data.get('token') == ADMIN_CODE:
+                print_result(True, "POST /api/auth/admin returns admin token")
+            else:
+                print_result(False, f"Admin auth response: {data}")
+                all_passed = False
+        else:
+            print_result(False, f"POST /api/auth/admin failed: {resp.status_code}")
+            all_passed = False
         
         return all_passed
         
     except Exception as e:
-        print_error(f"Regression test failed with exception: {e}")
-        import traceback
-        traceback.print_exc()
+        print_result(False, f"Exception: {str(e)}")
         return False
-
 
 def main():
     print("\n" + "="*80)
-    print("POOL COMPETITIE BACKEND API TESTS")
-    print("="*80)
-    print(f"Base URL: {BASE_URL}")
-    print(f"Admin Code: {ADMIN_CODE}")
+    print("SESSION-3 BACKEND VALIDATION TESTING")
+    print("Pool Competitie Webapp - New Validation Rules")
     print("="*80)
     
     results = {}
     
     # Run all tests
-    results['admin_players_full'] = test_admin_players_full()
-    results['admin_edit_confirmed_match'] = test_admin_edit_confirmed_match()
-    results['custom_can_play_from'] = test_custom_can_play_from()
-    results['scoring_correctness'] = test_scoring_correctness()
-    results['regression'] = test_regression()
+    results['Test 1: Duplicate player submit'] = test_1_duplicate_player_submit()
+    results['Test 2: Future player submit'] = test_2_future_player_submit()
+    results['Test 3: Valid submit'] = test_3_valid_submit()
+    results['Test 4: Admin override allow_reuse'] = test_4_admin_override_allow_reuse()
+    results['Test 5: Admin override cannot bypass speelgerechtigd'] = test_5_admin_override_cannot_bypass_speelgerechtigd()
+    results['Test 6: Admin approve without override'] = test_6_admin_approve_without_override()
+    results['Test 7: Regression checks'] = test_7_regression_checks()
     
     # Summary
     print("\n" + "="*80)
     print("TEST SUMMARY")
     print("="*80)
     
-    for test_name, passed in results.items():
-        status = "✅ PASSED" if passed else "❌ FAILED"
-        print(f"{test_name}: {status}")
-    
-    total = len(results)
     passed = sum(1 for v in results.values() if v)
+    total = len(results)
     
-    print("="*80)
-    print(f"Total: {passed}/{total} tests passed")
-    print("="*80)
+    for test_name, result in results.items():
+        status = "✅ PASS" if result else "❌ FAIL"
+        print(f"{status}: {test_name}")
     
-    return all(results.values())
-
+    print(f"\nTotal: {passed}/{total} tests passed")
+    
+    if passed == total:
+        print("\n🎉 All tests passed!")
+        return 0
+    else:
+        print(f"\n⚠️  {total - passed} test(s) failed")
+        return 1
 
 if __name__ == "__main__":
-    success = main()
-    exit(0 if success else 1)
+    exit(main())

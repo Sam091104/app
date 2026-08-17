@@ -176,6 +176,38 @@ async function verifyTeam(db, code) {
   return stripId(await db.collection('teams').findOne({ code: (code || '').trim().toUpperCase() }))
 }
 
+// ---- Validation helpers ----
+async function validateMatchGames(db, matchDate, games, homeTeamId, awayTeamId, allowReuse) {
+  const errors = []
+  const md = new Date(matchDate)
+  const allTeamPlayerIds = new Set()
+  const homePlayers = (await db.collection('players').find({ team_id: homeTeamId }).toArray()).map(stripId)
+  const awayPlayers = (await db.collection('players').find({ team_id: awayTeamId }).toArray()).map(stripId)
+  const playerMap = {}
+  for (const p of [...homePlayers, ...awayPlayers]) { playerMap[p.id] = p; allTeamPlayerIds.add(p.id) }
+  const seenHome = {}, seenAway = {}
+  ;(games || []).forEach((g, idx) => {
+    const label = `partij ${idx + 1}`
+    for (const pid of g.home_players || []) {
+      const p = playerMap[pid]
+      if (!p) { errors.push(`${label}: onbekende thuis-speler`); continue }
+      if (p.team_id !== homeTeamId) errors.push(`${label}: speler ${p.name} hoort niet bij de thuisploeg`)
+      if (p.is_placeholder) errors.push(`${label}: placeholder-speler mag niet ingezet worden`)
+      if (p.can_play_from && new Date(p.can_play_from) > md) errors.push(`${label}: ${p.name} is nog niet speelgerechtigd (vanaf ${new Date(p.can_play_from).toLocaleDateString('nl-BE')})`)
+      if (!allowReuse) { if (seenHome[pid]) errors.push(`${label}: ${p.name} is al ingezet in partij ${seenHome[pid]}`); else seenHome[pid] = idx + 1 }
+    }
+    for (const pid of g.away_players || []) {
+      const p = playerMap[pid]
+      if (!p) { errors.push(`${label}: onbekende uit-speler`); continue }
+      if (p.team_id !== awayTeamId) errors.push(`${label}: speler ${p.name} hoort niet bij de uitploeg`)
+      if (p.is_placeholder) errors.push(`${label}: placeholder-speler mag niet ingezet worden`)
+      if (p.can_play_from && new Date(p.can_play_from) > md) errors.push(`${label}: ${p.name} is nog niet speelgerechtigd (vanaf ${new Date(p.can_play_from).toLocaleDateString('nl-BE')})`)
+      if (!allowReuse) { if (seenAway[pid]) errors.push(`${label}: ${p.name} is al ingezet in partij ${seenAway[pid]}`); else seenAway[pid] = idx + 1 }
+    }
+  })
+  return errors
+}
+
 // -------- Router --------
 async function handleRoute(request, { params }) {
   const { path = [] } = await params
@@ -231,6 +263,9 @@ async function handleRoute(request, { params }) {
       const code = (body.team_code || '').trim().toUpperCase()
       if (code !== home?.code && code !== away?.code) return handleCORS(NextResponse.json({ error: 'invalid code' }, { status: 403 }))
       if (m.status !== 'scheduled') return handleCORS(NextResponse.json({ error: 'already submitted' }, { status: 400 }))
+      // Validation: speelgerechtigd + geen dubbele inzet
+      const validationErrors = await validateMatchGames(db, m.date, body.games, m.home_team_id, m.away_team_id, false)
+      if (validationErrors.length) return handleCORS(NextResponse.json({ error: 'Validatiefouten', errors: validationErrors }, { status: 400 }))
       const rules = await getScoring(db)
       const totals = computeMatchTotals(body.games, rules)
       const submittedBy = code === home?.code ? 'home' : 'away'
@@ -404,6 +439,14 @@ async function handleRoute(request, { params }) {
       const m = stripId(await db.collection('matches').findOne({ id }))
       if (!m) return handleCORS(NextResponse.json({ error: 'not found' }, { status: 404 }))
       const games = body.games || m.games
+      // Validate speelgerechtigd + dubbele inzet (allow_reuse=true skips the dubbele-inzet check but not speelgerechtigd)
+      const allowReuse = !!body.allow_reuse
+      const validationErrors = await validateMatchGames(db, m.date, games, m.home_team_id, m.away_team_id, allowReuse)
+      // Filter out placeholder + speelgerechtigd errors - hard blockers regardless of override
+      const hardErrors = validationErrors.filter(e => !e.includes('is al ingezet in partij'))
+      if (hardErrors.length) return handleCORS(NextResponse.json({ error: 'Validatiefouten', errors: hardErrors }, { status: 400 }))
+      const softErrors = validationErrors.filter(e => e.includes('is al ingezet in partij'))
+      if (softErrors.length && !allowReuse) return handleCORS(NextResponse.json({ error: 'Validatiefouten', errors: softErrors }, { status: 400 }))
       const rules = await getScoring(db)
       const totals = computeMatchTotals(games, rules)
       await db.collection('matches').updateOne({ id }, { $set: { games, points_home: totals.home, points_away: totals.away, status: 'admin_approved', confirmed_at: new Date().toISOString() } })

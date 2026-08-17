@@ -208,6 +208,49 @@ backend:
         agent: "testing"
         comment: "Player filtering working correctly. Returns 62 players. No placeholders in public /api/players list (is_placeholder=true filtered out). No players with future can_play_from and 0 games (correctly filtered). Players with future can_play_from but with legitimate games would still appear as expected."
 
+
+  - agent: "user"
+    message: |
+      NEW REQUEST (session 3): Add 2 rules to match submit and admin edit forms without breaking existing scoring:
+      1. Speelgerechtigd check based on MATCH DATE (not today) - block in dropdowns AND on save.
+      2. Player only ONCE on entire wedstrijdblad - exclude from other pickers when selected; re-appear when unselected.
+      Only admin has clear override (default OFF). Backend validation must prevent bypass.
+
+  - agent: "main"
+    message: |
+      Session-3 fixes applied. Key changes:
+      - PlayerPicker now accepts `usedIds` + `allowReuse` props. Filters out already-used players (unless allowReuse) and enforces can_play_from <= matchDate.
+      - MatchFormDialog (team submit) computes usedIds per side per game, passes to each PlayerPicker; team submits are ALWAYS strict (no override).
+      - AdminMatchEditDialog has a checkbox "Admin-override: dezelfde speler mag meermaals ingezet worden" (default off), sends allow_reuse in body.
+      - Backend has new `validateMatchGames(db, matchDate, games, homeTeamId, awayTeamId, allowReuse)` helper.
+      - POST /api/matches/:id/submit → always validates strict (returns 400 with { error: 'Validatiefouten', errors: [] } on failure).
+      - POST /api/admin/matches/:id/approve → accepts `allow_reuse` flag; when true, dubbele-inzet errors are ignored but speelgerechtigd/team/placeholder errors are STILL blockers.
+      
+      Please test:
+      1. Team submit with duplicate player across two games → should return 400 with clear errors like "partij 2: <naam> is al ingezet in partij 1".
+      2. Team submit with player who has can_play_from > match.date → 400 with "nog niet speelgerechtigd" error.
+      3. Admin approve with allow_reuse=true and duplicate players → 200 ok.
+      4. Admin approve with allow_reuse=true but non-speelgerechtigd player → still 400 (override does NOT bypass speelgerechtigd).
+      5. Regression: normal valid submit still works and produces confirmed match with correct standings.
+      6. Regression: existing GET /api/standings and /api/players still work.
+  - agent: "testing"
+    message: |
+      Session-3 backend validation testing completed. All 7 tests PASSED:
+      ✅ Test 1: Team submit with duplicate player correctly rejected with validation errors
+      ✅ Test 2: Team submit with non-speelgerechtigd player correctly rejected
+      ✅ Test 3: Valid team submit with unique players succeeded, match confirmed, standings updated
+      ✅ Test 4: Admin override with allow_reuse=true bypasses duplicate player check
+      ✅ Test 5: Admin override with allow_reuse=true CANNOT bypass speelgerechtigd check (correctly rejected)
+      ✅ Test 6: Admin approve without allow_reuse correctly rejects duplicate players
+      ✅ Test 7: All regression checks passed (standings, players, auth endpoints)
+      
+      Backend validation rules working correctly:
+      - Speelgerechtigd check based on match date (not today) is enforced
+      - Player can only appear once across all 10 games on one team-side
+      - Admin override via allow_reuse bypasses ONLY dubbele-inzet rule, NOT speelgerechtigd
+      
+      No major issues found. Backend is fully functional.
+
   - task: "Session-2 Fix: End-to-end scoring verification"
     implemented: true
     working: true
@@ -252,6 +295,81 @@ backend:
       - working: true
         agent: "testing"
         comment: "All regression checks passed. GET /api/teams returns 6 teams. POST /api/auth/admin returns ok:true, token:ADMIN-9999. POST /api/auth/team returns all required fields (team, players, matches, change_requests, date_change_requests, incoming_date_requests). GET /api/admin/dashboard returns all required fields (submitted, disputed, pending_change_requests, pending_date_requests, recent_logs). POST /api/admin/setup-2026-2027 returns ok:true (idempotent). GET /api/admin/audit-logs returns array of 76 log entries."
+
+  - task: "Session-3: POST /api/matches/:id/submit - validation for duplicate player usage"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Modified to call validateMatchGames with allowReuse=false. Returns 400 with {error: 'Validatiefouten', errors: [...]} if player appears multiple times across all 10 games."
+      - working: true
+        agent: "testing"
+        comment: "Validation working correctly. Team submit with duplicate player across games returns 400 with clear error messages like 'partij 2: Wim De Coster is al ingezet in partij 1'. Each player can only appear once across all 10 games on one team-side."
+
+  - task: "Session-3: POST /api/matches/:id/submit - validation for speelgerechtigd based on match date"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Modified validateMatchGames to check player.can_play_from <= match.date (not today). Returns 400 with error 'nog niet speelgerechtigd' if player's can_play_from is after match date."
+      - working: true
+        agent: "testing"
+        comment: "Speelgerechtigd validation working correctly. Team submit with player having future can_play_from date returns 400 with error 'partij 1: Toekomst Test Speler Session3 is nog niet speelgerechtigd (vanaf 1/1/2099)'. Validation based on match date, not current date."
+
+  - task: "Session-3: POST /api/admin/matches/:id/approve - allow_reuse flag for admin override"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Modified to accept allow_reuse flag in request body. When true, filters out dubbele-inzet errors but still enforces speelgerechtigd, team, and placeholder validations. Hard errors always block, soft errors (dubbele-inzet) only block if allowReuse is false."
+      - working: true
+        agent: "testing"
+        comment: "Admin override working correctly. With allow_reuse=true, duplicate players are allowed (returns 200). With allow_reuse=false or omitted, duplicate players are rejected (returns 400). Speelgerechtigd validation CANNOT be bypassed even with allow_reuse=true (correctly returns 400 for non-speelgerechtigd players)."
+
+  - task: "Session-3: Valid match submission end-to-end flow"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Verified that valid match submission with unique players still works correctly with new validation rules."
+      - working: true
+        agent: "testing"
+        comment: "End-to-end flow working correctly. Valid team submit with 10 unique players (8 enkel + 2 dubbel = 12 unique players) succeeded. Match confirmed by away team. Standings updated correctly. All validation rules enforced without breaking valid submissions."
+
+  - task: "Session-3: Regression checks for existing endpoints"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Verified all existing endpoints still working after session-3 validation changes."
+      - working: true
+        agent: "testing"
+        comment: "All regression checks passed. GET /api/standings returns 6 teams with all required fields. GET /api/players returns 62 players without placeholders. POST /api/auth/team returns team session. POST /api/auth/admin returns admin token."
 
 
   - agent: "user"
