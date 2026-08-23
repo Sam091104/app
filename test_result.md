@@ -230,6 +230,32 @@ backend:
       1. Team submit with duplicate player across two games → should return 400 with clear errors like "partij 2: <naam> is al ingezet in partij 1".
       2. Team submit with player who has can_play_from > match.date → 400 with "nog niet speelgerechtigd" error.
       3. Admin approve with allow_reuse=true and duplicate players → 200 ok.
+
+  - agent: "user"
+    message: |
+      SESSION-4: Split ploegpunten (team points) from persoonlijke punten (player points).
+      - Ploegpunten (team standings): fixed rule 2-0 → 2/0, 2-1 → 2/1 (max 20 per match, cannot be changed in settings)
+      - Persoonlijke punten (player stats): configurable via Admin settings (defaults 2-0 → 3/0, 2-1 → 2/1)
+      - Frames blijven altijd werkelijke gewonnen/verloren sets.
+
+  - agent: "main"
+    message: |
+      Implemented session-4 split. Changes:
+      - Added new backend function teamPointsForFrames(hf, af) with FIXED rules: 2-0→2/0, 2-1→2/1
+      - computeMatchTotals(games) now uses teamPointsForFrames (was: pointsForFrames with rules)
+      - computeStandings now uses teamPointsForFrames for points_for / points_against
+      - computePlayerStats still uses pointsForFrames (configurable rules) — unchanged, player rankings unaffected
+      - Match submit and admin approve store team points as points_home/points_away
+      - Match detail UI: label changed to "Ploegpunten (2-0→2, 2-1→2/1)"
+      - Klassement description updated
+      - Live tussenstand in match forms now shows team points total
+      
+      Please test:
+      1. GET /api/standings — points_for/points_against should now use team scoring. For 10 games all 2-0 home wins: points_home=20 (not 30).
+      2. Submit a fresh match with 5×2-0 home + 5×2-1 home wins: team points = 5×2 + 5×2 = 20 for home, 0 + 5×1 = 5 for away.
+      3. Player stats via GET /api/players still use configurable scoring (should be 3 for 2-0 by default).
+      4. Verify admin settings scoring.frames_2_0 still ONLY affects player stats, NOT team standings.
+
       4. Admin approve with allow_reuse=true but non-speelgerechtigd player → still 400 (override does NOT bypass speelgerechtigd).
       5. Regression: normal valid submit still works and produces confirmed match with correct standings.
       6. Regression: existing GET /api/standings and /api/players still work.
@@ -452,7 +478,7 @@ frontend:
 metadata:
   created_by: "main_agent"
   version: "1.0"
-  test_sequence: 3
+  test_sequence: 4
   run_ui: false
 
 test_plan:
@@ -481,3 +507,78 @@ agent_communication:
       ✅ All existing endpoints regression tests passed
       
       Minor issue found: One placeholder for team 'Canada' has name 'sammeke' (player_id: e1b8cad7-b35d-4d56-8926-fd37e1285f28) instead of 'Speler te kort'. This is a data inconsistency but does not affect functionality.
+
+  - task: "Session-4: Team points (ploegpunten) use fixed rules 2-0→2/0, 2-1→2/1"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Added teamPointsForFrames() function with fixed rules. computeMatchTotals() now uses teamPointsForFrames for match.points_home/points_away. Max 20 points per match (10 games × 2 points max)."
+      - working: true
+        agent: "testing"
+        comment: "Team points correctly calculated. Test 1: 10×2-0 home wins = 20/0 points (NOT 30/0), 20/0 frames. Test 2: 10×2-1 home wins = 20/10 points. Test 3: 5×2-0 + 5×2-1 = 20/5 points. Standings correctly updated with team points (points_for increased by 20, not 30)."
+
+  - task: "Session-4: Player stats (persoonlijke punten) use configurable rules"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "computePlayerStats() still uses pointsForFrames() with configurable rules from settings. Default: 2-0→3/0, 2-1→2/1. Player enkel_points and dubbel_points reflect configurable scoring."
+      - working: true
+        agent: "testing"
+        comment: "Player stats correctly use configurable rules. Test 4: Player who won 1 game 2-0 got 3 enkel_points (NOT 2). Default scoring verified: frames_2_0=[3,0], frames_2_1=[2,1]."
+
+  - task: "Session-4: Admin settings only affect player stats, not team standings"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "POST /api/admin/settings updates scoring rules in settings collection. computePlayerStats uses these rules. computeStandings and computeMatchTotals use fixed teamPointsForFrames, NOT affected by settings."
+      - working: true
+        agent: "testing"
+        comment: "Admin settings correctly affect ONLY player stats. Test 5: Changed scoring to frames_2_0=[5,0]. Player got 5 points for 2-0 win. Team standings still got 20 points (fixed team rules), NOT affected by settings change. Settings restored to default after test."
+
+  - task: "Session-4: Regression checks"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "testing"
+        comment: "All regression checks passed. GET /api/teams returns 6 teams. GET /api/admin/players-full returns 70 players with 6 placeholders. Validation rules still work: duplicate player submit correctly rejected with 400."
+
+  - agent: "testing"
+    message: |
+      Session-4 backend testing completed. All 6 tests PASSED:
+      ✅ Test 1: Team points max 20 for 10×2-0 (verified 20/0, NOT 30/0)
+      ✅ Test 2: Team points 20/10 for 10×2-1
+      ✅ Test 3: Mixed match 5×2-0 + 5×2-1 = 20/5
+      ✅ Test 4: Player stats use configurable rules (3 for 2-0, NOT 2)
+      ✅ Test 5: Admin settings only affect player stats, NOT team standings
+      ✅ Test 6: Regression checks (teams, players-full, validation)
+      
+      Key findings:
+      - Ploegpunten (team standings): Fixed rules 2-0→2/0, 2-1→2/1, max 20 per match ✅
+      - Persoonlijke punten (player stats): Configurable via /api/admin/settings (default 2-0→3/0, 2-1→2/1) ✅
+      - Frames blijven altijd werkelijke gewonnen/verloren sets ✅
+      - Settings changes affect ONLY player stats, NOT team standings ✅
+      
+      Backend is fully functional with no major issues found.

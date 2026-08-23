@@ -32,9 +32,18 @@ function pointsForFrames(hf, af, rules) {
   if (h === 1 && a === 2) return { home: lose2_1, away: win2_1 }
   return { home: 0, away: 0 }
 }
-function computeMatchTotals(games, rules) {
+// Team points (ploegpunten): fixed rules, 2-0 -> 2/0, 2-1 -> 2/1
+function teamPointsForFrames(hf, af) {
+  const h = Number(hf) || 0, a = Number(af) || 0
+  if (h === 2 && a === 0) return { home: 2, away: 0 }
+  if (h === 0 && a === 2) return { home: 0, away: 2 }
+  if (h === 2 && a === 1) return { home: 2, away: 1 }
+  if (h === 1 && a === 2) return { home: 1, away: 2 }
+  return { home: 0, away: 0 }
+}
+function computeMatchTotals(games) {
   let home = 0, away = 0
-  for (const g of games || []) { const p = pointsForFrames(g.home_frames, g.away_frames, rules); home += p.home; away += p.away }
+  for (const g of games || []) { const p = teamPointsForFrames(g.home_frames, g.away_frames); home += p.home; away += p.away }
   return { home, away }
 }
 
@@ -95,18 +104,17 @@ async function logAudit(db, entry) {
 async function computeStandings(db) {
   const teams = (await db.collection('teams').find({}).toArray()).map(stripId)
   const matches = (await db.collection('matches').find({ status: { $in: ['confirmed', 'admin_approved'] } }).toArray()).map(stripId)
-  const rules = await getScoring(db)
   const stats = {}
   for (const t of teams) stats[t.id] = { team_id: t.id, team_name: t.name, played: 0, won: 0, lost: 0, drawn: 0, points_for: 0, points_against: 0, frames_won: 0, frames_lost: 0, framebalans: 0, saldo: 0, comp_points: 0, total_points: 0 }
   for (const m of matches) {
     if (!m.games || !Array.isArray(m.games) || m.games.length === 0) continue
     const s = stats[m.home_team_id], s2 = stats[m.away_team_id]; if (!s || !s2) continue
-    // Recompute points and frames from games (defensive - ignore stored points_home/away)
+    // Ploegpunten (team points): fixed 2-0->2/0, 2-1->2/1. Frames = werkelijke sets.
     let ph = 0, pa = 0, fh = 0, fa = 0
     for (const g of m.games) {
       const hf = Number(g.home_frames) || 0, af = Number(g.away_frames) || 0
-      const pts = pointsForFrames(hf, af, rules)
-      ph += pts.home; pa += pts.away
+      const tp = teamPointsForFrames(hf, af)
+      ph += tp.home; pa += tp.away
       fh += hf; fa += af
     }
     s.played += 1; s2.played += 1
@@ -267,7 +275,7 @@ async function handleRoute(request, { params }) {
       const validationErrors = await validateMatchGames(db, m.date, body.games, m.home_team_id, m.away_team_id, false)
       if (validationErrors.length) return handleCORS(NextResponse.json({ error: 'Validatiefouten', errors: validationErrors }, { status: 400 }))
       const rules = await getScoring(db)
-      const totals = computeMatchTotals(body.games, rules)
+      const totals = computeMatchTotals(body.games)
       const submittedBy = code === home?.code ? 'home' : 'away'
       await db.collection('matches').updateOne({ id }, { $set: { games: body.games, points_home: totals.home, points_away: totals.away, status: 'submitted', remarks: body.remarks || '', submitted_by: submittedBy, submitted_at: new Date().toISOString() } })
       await logAudit(db, { actor: submittedBy === 'home' ? home.name : away.name, action: 'match_submitted', entity: 'match', entity_id: id, old_value: null, new_value: { points_home: totals.home, points_away: totals.away, submitted_by: submittedBy } })
@@ -448,7 +456,7 @@ async function handleRoute(request, { params }) {
       const softErrors = validationErrors.filter(e => e.includes('is al ingezet in partij'))
       if (softErrors.length && !allowReuse) return handleCORS(NextResponse.json({ error: 'Validatiefouten', errors: softErrors }, { status: 400 }))
       const rules = await getScoring(db)
-      const totals = computeMatchTotals(games, rules)
+      const totals = computeMatchTotals(games)
       await db.collection('matches').updateOne({ id }, { $set: { games, points_home: totals.home, points_away: totals.away, status: 'admin_approved', confirmed_at: new Date().toISOString() } })
       await logAudit(db, { actor: 'admin', action: 'match_admin_approved', entity: 'match', entity_id: id, old_value: { status: m.status, points_home: m.points_home, points_away: m.points_away }, new_value: { status: 'admin_approved', points_home: totals.home, points_away: totals.away } })
       return handleCORS(NextResponse.json({ ok: true, points_home: totals.home, points_away: totals.away }))
