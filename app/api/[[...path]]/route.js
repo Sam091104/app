@@ -1,11 +1,22 @@
 import { MongoClient } from 'mongodb'
 import { v4 as uuidv4 } from 'uuid'
 import { NextResponse } from 'next/server'
+import * as XLSX from 'xlsx'
 
-let client, db
+let client, db, connecting
 async function connectToMongo() {
-  if (!client) { client = new MongoClient(process.env.MONGO_URL); await client.connect(); db = client.db(process.env.DB_NAME) }
-  return db
+  if (db) return db
+  // Eén gedeelde connect-promise zodat gelijktijdige eerste requests niet een half-geïnitialiseerde client zien
+  if (!connecting) {
+    connecting = (async () => {
+      const c = new MongoClient(process.env.MONGO_URL)
+      await c.connect()
+      client = c
+      db = c.db(process.env.DB_NAME)
+      return db
+    })().catch(err => { connecting = null; throw err })
+  }
+  return connecting
 }
 function handleCORS(response) {
   response.headers.set('Access-Control-Allow-Origin', process.env.CORS_ORIGINS || '*')
@@ -41,10 +52,30 @@ function teamPointsForFrames(hf, af) {
   if (h === 1 && a === 2) return { home: 1, away: 2 }
   return { home: 0, away: 0 }
 }
-function computeMatchTotals(games) {
+// Ploegpunten van een wedstrijdblad. onlySingles = seizoensinstelling "alleen enkelwedstrijden tellen voor de ploegstand":
+// dubbels leveren dan geen ploegpunten op en bepalen de winnaar niet (individueel klassement telt ze wel).
+function gameCountsForTeam(g, onlySingles) { return !(onlySingles && g.type === 'dubbel') }
+function computeMatchTotals(games, onlySingles = false) {
   let home = 0, away = 0
-  for (const g of games || []) { const p = teamPointsForFrames(g.home_frames, g.away_frames); home += p.home; away += p.away }
+  for (const g of games || []) { if (!gameCountsForTeam(g, onlySingles)) continue; const p = teamPointsForFrames(g.home_frames, g.away_frames); home += p.home; away += p.away }
   return { home, away }
+}
+// Seizoensinstelling voor een wedstrijd opzoeken (match.season_id, anders actief seizoen)
+async function onlySinglesForMatch(db, match) {
+  let season = match?.season_id ? stripId(await db.collection('seasons').findOne({ id: match.season_id })) : null
+  if (!season) season = stripId(await db.collection('seasons').findOne({ active: true }))
+  return !!season?.only_singles_count
+}
+// Herbereken opgeslagen ploegpunten van alle wedstrijden met ingevulde partijen in een seizoen
+async function recalcSeasonMatches(db, seasonId, onlySingles) {
+  const matches = await db.collection('matches').find({ season_id: seasonId, games: { $exists: true, $ne: null, $not: { $size: 0 } } }).toArray()
+  let n = 0
+  for (const m of matches) {
+    if (!Array.isArray(m.games)) continue
+    const t = computeMatchTotals(m.games, onlySingles)
+    if (t.home !== m.points_home || t.away !== m.points_away) { await db.collection('matches').updateOne({ id: m.id }, { $set: { points_home: t.home, points_away: t.away, recalculated_at: new Date().toISOString() } }); n++ }
+  }
+  return { checked: matches.length, updated: n }
 }
 
 // -------- Seed --------
@@ -100,10 +131,32 @@ async function logAudit(db, entry) {
   await db.collection('audit_logs').insertOne({ id: uuidv4(), ts: new Date().toISOString(), ...entry })
 }
 
+// -------- Seasons helpers --------
+async function getActiveSeason(db) { return stripId(await db.collection('seasons').findOne({ active: true })) }
+// Match-filter voor een seizoen. Voor het actieve seizoen tellen ook wedstrijden zonder season_id mee (backwards compat).
+async function seasonMatchFilter(db, seasonId) {
+  const active = await getActiveSeason(db)
+  const sid = seasonId || active?.id
+  if (!sid) return {}
+  if (active && sid === active.id) return { $or: [{ season_id: sid }, { season_id: { $exists: false } }, { season_id: null }] }
+  return { season_id: sid }
+}
+function seasonStatus(s) { return s.active ? 'active' : (s.archived_at ? 'archived' : 'planned') }
+function seasonPublic(s, counts) { return { id: s.id, name: s.name, active: !!s.active, status: seasonStatus(s), start_date: s.start_date || null, end_date: s.end_date || null, description: s.description || '', created_at: s.created_at, archived_at: s.archived_at || null, champion: s.champion || null, only_singles_count: !!s.only_singles_count, has_snapshot: Array.isArray(s.final_standings) && s.final_standings.length > 0, final_standings: s.final_standings || null, final_player_stats: s.final_player_stats || null, ...(counts || {}) } }
+
 // -------- Standings & players --------
-async function computeStandings(db) {
-  const teams = (await db.collection('teams').find({}).toArray()).map(stripId)
-  const matches = (await db.collection('matches').find({ status: { $in: ['confirmed', 'admin_approved'] } }).toArray()).map(stripId)
+async function computeStandings(db, seasonId) {
+  const allTeams = (await db.collection('teams').find({}).toArray()).map(stripId)
+  const active = await getActiveSeason(db)
+  const filter = await seasonMatchFilter(db, seasonId)
+  const isActiveSeason = !seasonId || seasonId === active?.id
+  const allSeasonMatches = (await db.collection('matches').find(filter).toArray()).map(stripId)
+  // Voor gearchiveerde/geplande seizoenen enkel ploegen tonen die in dat seizoen wedstrijden hebben
+  const teamIdsInSeason = new Set(); for (const m of allSeasonMatches) { teamIdsInSeason.add(m.home_team_id); teamIdsInSeason.add(m.away_team_id) }
+  const teams = isActiveSeason ? allTeams : allTeams.filter(t => teamIdsInSeason.has(t.id))
+  const matches = allSeasonMatches.filter(m => ['confirmed', 'admin_approved'].includes(m.status))
+  const seasonDoc = seasonId && seasonId !== active?.id ? stripId(await db.collection('seasons').findOne({ id: seasonId })) : active
+  const onlySingles = !!seasonDoc?.only_singles_count
   const stats = {}
   for (const t of teams) stats[t.id] = { team_id: t.id, team_name: t.name, played: 0, won: 0, lost: 0, drawn: 0, points_for: 0, points_against: 0, frames_won: 0, frames_lost: 0, framebalans: 0, saldo: 0, comp_points: 0, total_points: 0 }
   for (const m of matches) {
@@ -112,6 +165,7 @@ async function computeStandings(db) {
     // Ploegpunten (team points): fixed 2-0->2/0, 2-1->2/1. Frames = werkelijke sets.
     let ph = 0, pa = 0, fh = 0, fa = 0
     for (const g of m.games) {
+      if (!gameCountsForTeam(g, onlySingles)) continue // dubbels tellen niet mee voor de ploegstand als de seizoensinstelling aan staat
       const hf = Number(g.home_frames) || 0, af = Number(g.away_frames) || 0
       const tp = teamPointsForFrames(hf, af)
       ph += tp.home; pa += tp.away
@@ -129,15 +183,16 @@ async function computeStandings(db) {
   for (const id in stats) { stats[id].framebalans = stats[id].frames_won - stats[id].frames_lost; stats[id].saldo = stats[id].points_for - stats[id].points_against; stats[id].total_points = stats[id].comp_points }
   return Object.values(stats).sort((a, b) => b.comp_points - a.comp_points || b.framebalans - a.framebalans || b.frames_won - a.frames_won || a.team_name.localeCompare(b.team_name))
 }
-async function computePlayerStats(db) {
+async function computePlayerStats(db, seasonId) {
   const players = (await db.collection('players').find({}).toArray()).map(stripId)
   const teams = (await db.collection('teams').find({}).toArray()).map(stripId)
   const tmap = Object.fromEntries(teams.map(t => [t.id, t.name]))
   const rules = await getScoring(db)
-  const matches = (await db.collection('matches').find({ status: { $in: ['confirmed', 'admin_approved'] } }).toArray()).map(stripId)
+  const filter = await seasonMatchFilter(db, seasonId)
+  const matches = (await db.collection('matches').find({ ...filter, status: { $in: ['confirmed', 'admin_approved'] } }).toArray()).map(stripId)
   const now = new Date()
   const stats = {}
-  for (const p of players) stats[p.id] = { player_id: p.id, name: p.name, team_id: p.team_id, team_name: tmap[p.team_id] || '', is_placeholder: !!p.is_placeholder, can_play_from: p.can_play_from || null, joined_at: p.joined_at || null, played: 0, won: 0, lost: 0, enkel_played: 0, enkel_won: 0, enkel_frames_won: 0, enkel_frames_lost: 0, enkel_points: 0, dubbel_played: 0, dubbel_won: 0, dubbel_frames_won: 0, dubbel_frames_lost: 0, dubbel_points: 0, points: 0 }
+  for (const p of players) stats[p.id] = { player_id: p.id, name: p.name, team_id: p.team_id, team_name: tmap[p.team_id] || '', is_placeholder: !!p.is_placeholder, active: p.active !== false, can_play_from: p.can_play_from || null, joined_at: p.joined_at || null, played: 0, won: 0, lost: 0, enkel_played: 0, enkel_won: 0, enkel_frames_won: 0, enkel_frames_lost: 0, enkel_points: 0, dubbel_played: 0, dubbel_won: 0, dubbel_frames_won: 0, dubbel_frames_lost: 0, dubbel_points: 0, points: 0 }
   const playerMap = Object.fromEntries(players.map(p => [p.id, p]))
   for (const m of matches) {
     if (!m.games) continue
@@ -170,6 +225,7 @@ async function computePlayerStats(db) {
   // Filter out placeholders AND players who are not yet speelgerechtigd (future can_play_from) AND have no legit played games
   return Object.values(stats).filter(s => {
     if (s.is_placeholder) return false
+    if (s.active === false && s.played === 0) return false
     if (s.can_play_from && new Date(s.can_play_from) > now && s.played === 0) return false
     return true
   }).map(s => { const tfw = s.enkel_frames_won + s.dubbel_frames_won; const tfl = s.enkel_frames_lost + s.dubbel_frames_lost; return { ...s, total_frames_won: tfw, total_frames_lost: tfl, framebalans: tfw - tfl, win_pct: s.played ? Math.round((s.won / s.played) * 100) : 0 } }).sort((a, b) => b.points - a.points || b.total_frames_won - a.total_frames_won || b.framebalans - a.framebalans || a.name.localeCompare(b.name))
@@ -184,33 +240,61 @@ async function verifyTeam(db, code) {
   return stripId(await db.collection('teams').findOne({ code: (code || '').trim().toUpperCase() }))
 }
 
+// Aantal wedstrijdbladen waarop elke speler voorkomt (alle statussen met ingevulde games)
+async function playerMatchUsage(db) {
+  const matches = await db.collection('matches').find({ games: { $exists: true, $ne: [] } }, { projection: { id: 1, games: 1 } }).toArray()
+  const usage = {}
+  for (const m of matches) {
+    const ids = new Set()
+    for (const g of m.games || []) { for (const pid of g.home_players || []) ids.add(pid); for (const pid of g.away_players || []) ids.add(pid) }
+    for (const pid of ids) usage[pid] = (usage[pid] || 0) + 1
+  }
+  return usage
+}
+
 // ---- Validation helpers ----
+// Regels spelersselectie:
+//  - een speler mag max. 1 enkelwedstrijd spelen per wedstrijdblad
+//  - een speler mag max. 1 dubbelwedstrijd spelen per wedstrijdblad
+//  - een enkelwedstrijd blokkeert een speler NIET voor een dubbelwedstrijd
+//  - dezelfde speler mag niet 2x binnen één dubbelwedstrijd staan
+//  - allowReuse (admin-override) schakelt enkel de "max. 1 per type"-regel uit
 async function validateMatchGames(db, matchDate, games, homeTeamId, awayTeamId, allowReuse) {
   const errors = []
   const md = new Date(matchDate)
-  const allTeamPlayerIds = new Set()
   const homePlayers = (await db.collection('players').find({ team_id: homeTeamId }).toArray()).map(stripId)
   const awayPlayers = (await db.collection('players').find({ team_id: awayTeamId }).toArray()).map(stripId)
   const playerMap = {}
-  for (const p of [...homePlayers, ...awayPlayers]) { playerMap[p.id] = p; allTeamPlayerIds.add(p.id) }
-  const seenHome = {}, seenAway = {}
+  for (const p of [...homePlayers, ...awayPlayers]) playerMap[p.id] = p
+  const seen = { home: { enkel: {}, dubbel: {} }, away: { enkel: {}, dubbel: {} } }
+  const typeLabel = { enkel: 'enkelwedstrijd', dubbel: 'dubbelwedstrijd' }
   ;(games || []).forEach((g, idx) => {
     const label = `partij ${idx + 1}`
-    for (const pid of g.home_players || []) {
-      const p = playerMap[pid]
-      if (!p) { errors.push(`${label}: onbekende thuis-speler`); continue }
-      if (p.team_id !== homeTeamId) errors.push(`${label}: speler ${p.name} hoort niet bij de thuisploeg`)
-      if (p.is_placeholder) errors.push(`${label}: placeholder-speler mag niet ingezet worden`)
-      if (p.can_play_from && new Date(p.can_play_from) > md) errors.push(`${label}: ${p.name} is nog niet speelgerechtigd (vanaf ${new Date(p.can_play_from).toLocaleDateString('nl-BE')})`)
-      if (!allowReuse) { if (seenHome[pid]) errors.push(`${label}: ${p.name} is al ingezet in partij ${seenHome[pid]}`); else seenHome[pid] = idx + 1 }
-    }
-    for (const pid of g.away_players || []) {
-      const p = playerMap[pid]
-      if (!p) { errors.push(`${label}: onbekende uit-speler`); continue }
-      if (p.team_id !== awayTeamId) errors.push(`${label}: speler ${p.name} hoort niet bij de uitploeg`)
-      if (p.is_placeholder) errors.push(`${label}: placeholder-speler mag niet ingezet worden`)
-      if (p.can_play_from && new Date(p.can_play_from) > md) errors.push(`${label}: ${p.name} is nog niet speelgerechtigd (vanaf ${new Date(p.can_play_from).toLocaleDateString('nl-BE')})`)
-      if (!allowReuse) { if (seenAway[pid]) errors.push(`${label}: ${p.name} is al ingezet in partij ${seenAway[pid]}`); else seenAway[pid] = idx + 1 }
+    const type = g.type === 'dubbel' ? 'dubbel' : 'enkel'
+    const need = type === 'dubbel' ? 2 : 1
+    for (const side of ['home', 'away']) {
+      const ids = g[side + '_players'] || []
+      const forfait = side === 'home' ? !!g.forfait_home : !!g.forfait_away
+      const teamId = side === 'home' ? homeTeamId : awayTeamId
+      const sideLabel = side === 'home' ? 'thuis' : 'uit'
+      if (!forfait && ids.length !== need) errors.push(`${label}: selecteer ${need} ${sideLabel}-speler${need > 1 ? 's' : ''} voor deze ${typeLabel[type]} (of markeer forfait)`)
+      // Dezelfde speler 2x binnen dezelfde partij
+      const inGame = new Set()
+      for (const pid of ids) {
+        if (inGame.has(pid)) { errors.push(`${label}: ${playerMap[pid]?.name || 'speler'} staat twee keer in dezelfde ${typeLabel[type]}`); continue }
+        inGame.add(pid)
+        const p = playerMap[pid]
+        if (!p) { errors.push(`${label}: onbekende ${sideLabel}-speler`); continue }
+        if (p.team_id !== teamId) errors.push(`${label}: speler ${p.name} hoort niet bij de ${side === 'home' ? 'thuisploeg' : 'uitploeg'}`)
+        if (p.is_placeholder) errors.push(`${label}: placeholder-speler mag niet ingezet worden`)
+        if (p.active === false) errors.push(`${label}: ${p.name} is gedeactiveerd en mag niet ingezet worden`)
+        if (p.can_play_from && new Date(p.can_play_from) > md) errors.push(`${label}: ${p.name} is nog niet speelgerechtigd (vanaf ${new Date(p.can_play_from).toLocaleDateString('nl-BE')})`)
+        if (!allowReuse) {
+          const prev = seen[side][type][pid]
+          if (prev) errors.push(`${label}: ${p.name} is al ingezet in partij ${prev} (${type}) – een speler mag maximaal één ${typeLabel[type]} spelen per wedstrijdblad`)
+          else seen[side][type][pid] = idx + 1
+        }
+      }
     }
   })
   return errors
@@ -221,6 +305,7 @@ async function handleRoute(request, { params }) {
   const { path = [] } = await params
   const route = `/${path.join('/')}`
   const method = request.method
+  const url = new URL(request.url)
   try {
     const db = await connectToMongo()
     await ensureSeed(db)
@@ -236,15 +321,17 @@ async function handleRoute(request, { params }) {
       const id = path[1]
       const team = stripId(await db.collection('teams').findOne({ id }))
       if (!team) return handleCORS(NextResponse.json({ error: 'not found' }, { status: 404 }))
-      const players = (await db.collection('players').find({ team_id: id }).toArray()).map(stripId)
+      const players = (await db.collection('players').find({ team_id: id, active: { $ne: false }, is_placeholder: { $ne: true } }).toArray()).map(stripId)
       const { code, ...pub } = team
       return handleCORS(NextResponse.json({ ...pub, players }))
     }
-    if (route === '/players' && method === 'GET') return handleCORS(NextResponse.json(await computePlayerStats(db)))
-    if (route === '/standings' && method === 'GET') return handleCORS(NextResponse.json(await computeStandings(db)))
+    if (route === '/players' && method === 'GET') return handleCORS(NextResponse.json(await computePlayerStats(db, url.searchParams.get('season_id') || undefined)))
+    if (route === '/standings' && method === 'GET') return handleCORS(NextResponse.json(await computeStandings(db, url.searchParams.get('season_id') || undefined)))
 
     if (route === '/matches' && method === 'GET') {
-      const matches = (await db.collection('matches').find({}).sort({ week: 1, date: 1 }).toArray()).map(stripId)
+      const sq = url.searchParams.get('season_id')
+      const mf = sq === 'all' ? {} : await seasonMatchFilter(db, sq || undefined)
+      const matches = (await db.collection('matches').find(mf).sort({ week: 1, date: 1 }).toArray()).map(stripId)
       const teams = (await db.collection('teams').find({}).toArray()).map(stripId)
       const tmap = Object.fromEntries(teams.map(t => [t.id, t.name]))
       return handleCORS(NextResponse.json(matches.map(m => ({ ...m, home_team_name: tmap[m.home_team_id], away_team_name: tmap[m.away_team_id] }))))
@@ -257,7 +344,7 @@ async function handleRoute(request, { params }) {
       const away = stripId(await db.collection('teams').findOne({ id: m.away_team_id }))
       const hp = (await db.collection('players').find({ team_id: m.home_team_id }).toArray()).map(stripId)
       const ap = (await db.collection('players').find({ team_id: m.away_team_id }).toArray()).map(stripId)
-      return handleCORS(NextResponse.json({ ...m, home_team_name: home?.name, away_team_name: away?.name, home_players: hp, away_players: ap }))
+      return handleCORS(NextResponse.json({ ...m, home_team_name: home?.name, away_team_name: away?.name, home_players: hp, away_players: ap, only_singles_count: await onlySinglesForMatch(db, m) }))
     }
 
     // Submit match (home OR away submits initial result -> status submitted, awaiting other team)
@@ -274,8 +361,7 @@ async function handleRoute(request, { params }) {
       // Validation: speelgerechtigd + geen dubbele inzet
       const validationErrors = await validateMatchGames(db, m.date, body.games, m.home_team_id, m.away_team_id, false)
       if (validationErrors.length) return handleCORS(NextResponse.json({ error: 'Validatiefouten', errors: validationErrors }, { status: 400 }))
-      const rules = await getScoring(db)
-      const totals = computeMatchTotals(body.games)
+      const totals = computeMatchTotals(body.games, await onlySinglesForMatch(db, m))
       const submittedBy = code === home?.code ? 'home' : 'away'
       await db.collection('matches').updateOne({ id }, { $set: { games: body.games, points_home: totals.home, points_away: totals.away, status: 'submitted', remarks: body.remarks || '', submitted_by: submittedBy, submitted_at: new Date().toISOString() } })
       await logAudit(db, { actor: submittedBy === 'home' ? home.name : away.name, action: 'match_submitted', entity: 'match', entity_id: id, old_value: null, new_value: { points_home: totals.home, points_away: totals.away, submitted_by: submittedBy } })
@@ -308,7 +394,8 @@ async function handleRoute(request, { params }) {
       const team = await verifyTeam(db, body.code)
       if (!team) return handleCORS(NextResponse.json({ error: 'invalid code' }, { status: 401 }))
       const players = (await db.collection('players').find({ team_id: team.id }).toArray()).map(stripId)
-      const matches = (await db.collection('matches').find({ $or: [{ home_team_id: team.id }, { away_team_id: team.id }] }).sort({ week: 1 }).toArray()).map(stripId)
+      const seasonF = await seasonMatchFilter(db)
+      const matches = (await db.collection('matches').find({ $and: [seasonF, { $or: [{ home_team_id: team.id }, { away_team_id: team.id }] }] }).sort({ week: 1 }).toArray()).map(stripId)
       const allTeams = (await db.collection('teams').find({}).toArray()).map(stripId)
       const tmap = Object.fromEntries(allTeams.map(t => [t.id, t.name]))
       const enriched = matches.map(m => ({ ...m, home_team_name: tmap[m.home_team_id], away_team_name: tmap[m.away_team_id] }))
@@ -455,8 +542,7 @@ async function handleRoute(request, { params }) {
       if (hardErrors.length) return handleCORS(NextResponse.json({ error: 'Validatiefouten', errors: hardErrors }, { status: 400 }))
       const softErrors = validationErrors.filter(e => e.includes('is al ingezet in partij'))
       if (softErrors.length && !allowReuse) return handleCORS(NextResponse.json({ error: 'Validatiefouten', errors: softErrors }, { status: 400 }))
-      const rules = await getScoring(db)
-      const totals = computeMatchTotals(games)
+      const totals = computeMatchTotals(games, await onlySinglesForMatch(db, m))
       await db.collection('matches').updateOne({ id }, { $set: { games, points_home: totals.home, points_away: totals.away, status: 'admin_approved', confirmed_at: new Date().toISOString() } })
       await logAudit(db, { actor: 'admin', action: 'match_admin_approved', entity: 'match', entity_id: id, old_value: { status: m.status, points_home: m.points_home, points_away: m.points_away }, new_value: { status: 'admin_approved', points_home: totals.home, points_away: totals.away } })
       return handleCORS(NextResponse.json({ ok: true, points_home: totals.home, points_away: totals.away }))
@@ -468,7 +554,7 @@ async function handleRoute(request, { params }) {
       const season = stripId(await db.collection('seasons').findOne({ active: true }))
       const team = { id: uuidv4(), name: body.name, code: (body.code || `${body.name.substring(0,3).toUpperCase()}-${Math.floor(1000 + Math.random() * 9000)}`).toUpperCase(), season_id: season?.id, created_at: new Date().toISOString() }
       await db.collection('teams').insertOne(team)
-      await logAudit(db, { actor: 'admin', action: 'team_created', entity: 'team', entity_id: team.id, old_value: null, new_value: { name: team.name, code: team.code } })
+      await logAudit(db, { actor: 'admin', action: 'team_created', entity: 'team', entity_id: team.id, old_value: null, new_value: { name: team.name } })
       return handleCORS(NextResponse.json(stripId(team)))
     }
     if (route.startsWith('/admin/teams/') && path.length === 3 && method === 'DELETE') {
@@ -480,6 +566,35 @@ async function handleRoute(request, { params }) {
       await logAudit(db, { actor: 'admin', action: 'team_deleted', entity: 'team', entity_id: id, old_value: { name: team?.name }, new_value: null })
       return handleCORS(NextResponse.json({ ok: true }))
     }
+    if (route.startsWith('/admin/teams/') && path.length === 3 && (method === 'PATCH' || method === 'PUT')) {
+      if (!isAdmin) return handleCORS(NextResponse.json({ error: 'unauthorized' }, { status: 401 }))
+      const id = path[2]; const body = await request.json()
+      const team = stripId(await db.collection('teams').findOne({ id }))
+      if (!team) return handleCORS(NextResponse.json({ error: 'Ploeg niet gevonden' }, { status: 404 }))
+      const upd = {}
+      if (body.name !== undefined) {
+        const name = String(body.name || '').trim()
+        if (!name) return handleCORS(NextResponse.json({ error: 'Ploegnaam mag niet leeg zijn' }, { status: 400 }))
+        const dupName = await db.collection('teams').findOne({ id: { $ne: id }, name: { $regex: `^${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' } })
+        if (dupName) return handleCORS(NextResponse.json({ error: `Er bestaat al een ploeg met de naam "${name}"` }, { status: 409 }))
+        upd.name = name
+      }
+      if (body.code !== undefined) {
+        const code = String(body.code || '').trim().toUpperCase().replace(/\s+/g, '')
+        if (code.length < 6) return handleCORS(NextResponse.json({ error: 'Ploegcode moet minstens 6 tekens lang zijn' }, { status: 400 }))
+        if (!/^[A-Z0-9-]+$/.test(code)) return handleCORS(NextResponse.json({ error: 'Ploegcode mag enkel letters, cijfers en streepjes bevatten' }, { status: 400 }))
+        const adminSetting = await db.collection('settings').findOne({ key: 'admin' })
+        if (adminSetting && adminSetting.code === code) return handleCORS(NextResponse.json({ error: 'Deze code is niet toegestaan' }, { status: 400 }))
+        const dupCode = await db.collection('teams').findOne({ id: { $ne: id }, code })
+        if (dupCode) return handleCORS(NextResponse.json({ error: 'Deze ploegcode is al in gebruik door een andere ploeg' }, { status: 409 }))
+        upd.code = code
+      }
+      if (!Object.keys(upd).length) return handleCORS(NextResponse.json({ error: 'Geen wijzigingen opgegeven' }, { status: 400 }))
+      upd.updated_at = new Date().toISOString()
+      await db.collection('teams').updateOne({ id }, { $set: upd })
+      await logAudit(db, { actor: 'admin', action: upd.code && !upd.name ? 'team_code_changed' : 'team_updated', entity: 'team', entity_id: id, old_value: { name: team.name, code_changed: !!upd.code }, new_value: { name: upd.name ?? team.name, code_changed: !!upd.code } })
+      return handleCORS(NextResponse.json({ ok: true, team: stripId(await db.collection('teams').findOne({ id })) }))
+    }
     if (route.startsWith('/admin/teams/') && path.length === 4 && path[3] === 'reset-code' && method === 'POST') {
       if (!isAdmin) return handleCORS(NextResponse.json({ error: 'unauthorized' }, { status: 401 }))
       const id = path[2]
@@ -487,7 +602,7 @@ async function handleRoute(request, { params }) {
       if (!team) return handleCORS(NextResponse.json({ error: 'not found' }, { status: 404 }))
       const newCode = `${team.name.substring(0,3).toUpperCase()}-${Math.floor(1000 + Math.random() * 9000)}`
       await db.collection('teams').updateOne({ id }, { $set: { code: newCode } })
-      await logAudit(db, { actor: 'admin', action: 'team_code_reset', entity: 'team', entity_id: id, old_value: { code: team.code }, new_value: { code: newCode } })
+      await logAudit(db, { actor: 'admin', action: 'team_code_reset', entity: 'team', entity_id: id, old_value: { name: team.name }, new_value: { code_reset: true } })
       return handleCORS(NextResponse.json({ ok: true, code: newCode }))
     }
     if (route === '/admin/teams-full' && method === 'GET') {
@@ -500,38 +615,96 @@ async function handleRoute(request, { params }) {
       const players = (await db.collection('players').find({}).toArray()).map(stripId)
       const teams = (await db.collection('teams').find({}).toArray()).map(stripId)
       const tmap = Object.fromEntries(teams.map(t => [t.id, t.name]))
-      return handleCORS(NextResponse.json(players.map(p => ({ player_id: p.id, name: p.name, team_id: p.team_id, team_name: tmap[p.team_id] || '', can_play_from: p.can_play_from || null, joined_at: p.joined_at || null, is_placeholder: !!p.is_placeholder, active: p.active !== false }))))
+      const usage = await playerMatchUsage(db)
+      return handleCORS(NextResponse.json(players.map(p => ({ player_id: p.id, name: p.name, team_id: p.team_id, team_name: tmap[p.team_id] || '', can_play_from: p.can_play_from || null, joined_at: p.joined_at || null, is_placeholder: !!p.is_placeholder, active: p.active !== false, locked: p.locked !== false, match_count: usage[p.id] || 0 }))))
+    }
+    if (route.startsWith('/admin/players/') && path.length === 3 && method === 'GET') {
+      if (!isAdmin) return handleCORS(NextResponse.json({ error: 'unauthorized' }, { status: 401 }))
+      const id = path[2]
+      const p = stripId(await db.collection('players').findOne({ id }))
+      if (!p) return handleCORS(NextResponse.json({ error: 'Speler niet gevonden' }, { status: 404 }))
+      const usage = await playerMatchUsage(db)
+      const team = stripId(await db.collection('teams').findOne({ id: p.team_id }))
+      return handleCORS(NextResponse.json({ ...p, player_id: p.id, team_name: team?.name || '', active: p.active !== false, locked: p.locked !== false, is_placeholder: !!p.is_placeholder, match_count: usage[p.id] || 0 }))
     }
 
     // Admin players CRUD
     if (route === '/admin/players' && method === 'POST') {
       if (!isAdmin) return handleCORS(NextResponse.json({ error: 'unauthorized' }, { status: 401 }))
       const body = await request.json()
-      const joined = new Date()
+      const name = String(body.name || '').trim()
+      if (!name) return handleCORS(NextResponse.json({ error: 'Naam is verplicht' }, { status: 400 }))
+      if (!body.team_id) return handleCORS(NextResponse.json({ error: 'Ploeg is verplicht' }, { status: 400 }))
+      const team = await db.collection('teams').findOne({ id: body.team_id })
+      if (!team) return handleCORS(NextResponse.json({ error: 'Ploeg niet gevonden' }, { status: 400 }))
+      const dup = await db.collection('players').findOne({ team_id: body.team_id, name: { $regex: `^${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' } })
+      if (dup) return handleCORS(NextResponse.json({ error: `Speler "${name}" bestaat al bij deze ploeg` }, { status: 409 }))
+      const joined = body.joined_at ? new Date(body.joined_at) : new Date()
+      if (isNaN(joined.getTime())) return handleCORS(NextResponse.json({ error: 'Ongeldige lid-sinds datum' }, { status: 400 }))
       let canPlayFrom
       if (body.can_play_from) {
         canPlayFrom = new Date(body.can_play_from)
+        if (isNaN(canPlayFrom.getTime())) return handleCORS(NextResponse.json({ error: 'Ongeldige speelgerechtigd-datum' }, { status: 400 }))
       } else {
         canPlayFrom = new Date(joined); canPlayFrom.setMonth(canPlayFrom.getMonth() + 2)
       }
-      const p = { id: uuidv4(), team_id: body.team_id, name: body.name, active: true, locked: true, joined_at: joined.toISOString(), can_play_from: canPlayFrom.toISOString() }
+      const p = { id: uuidv4(), team_id: body.team_id, name, active: body.active === undefined ? true : !!body.active, locked: body.locked === undefined ? true : !!body.locked, is_placeholder: !!body.is_placeholder, joined_at: joined.toISOString(), can_play_from: canPlayFrom.toISOString(), created_at: new Date().toISOString() }
       await db.collection('players').insertOne(p)
-      await logAudit(db, { actor: 'admin', action: 'player_created', entity: 'player', entity_id: p.id, old_value: null, new_value: { name: p.name, team_id: p.team_id, can_play_from: canPlayFrom.toISOString() } })
+      await logAudit(db, { actor: 'admin', action: 'player_created', entity: 'player', entity_id: p.id, old_value: null, new_value: { name: p.name, team_id: p.team_id, active: p.active, can_play_from: canPlayFrom.toISOString() } })
       return handleCORS(NextResponse.json(stripId(p)))
     }
-    if (route.startsWith('/admin/players/') && path.length === 3 && method === 'PATCH') {
+    if (route.startsWith('/admin/players/') && path.length === 3 && (method === 'PATCH' || method === 'PUT')) {
       if (!isAdmin) return handleCORS(NextResponse.json({ error: 'unauthorized' }, { status: 401 }))
       const id = path[2]; const body = await request.json()
       const old = stripId(await db.collection('players').findOne({ id }))
-      await db.collection('players').updateOne({ id }, { $set: body })
-      await logAudit(db, { actor: 'admin', action: 'player_updated', entity: 'player', entity_id: id, old_value: old, new_value: body })
-      return handleCORS(NextResponse.json({ ok: true }))
+      if (!old) return handleCORS(NextResponse.json({ error: 'Speler niet gevonden' }, { status: 404 }))
+      const upd = {}
+      if (body.name !== undefined) {
+        const name = String(body.name || '').trim()
+        if (!name) return handleCORS(NextResponse.json({ error: 'Naam mag niet leeg zijn' }, { status: 400 }))
+        upd.name = name
+      }
+      if (body.team_id !== undefined) {
+        const team = await db.collection('teams').findOne({ id: body.team_id })
+        if (!team) return handleCORS(NextResponse.json({ error: 'Ploeg niet gevonden' }, { status: 400 }))
+        upd.team_id = body.team_id
+      }
+      if (body.active !== undefined) upd.active = !!body.active
+      if (body.locked !== undefined) upd.locked = !!body.locked
+      if (body.is_placeholder !== undefined) upd.is_placeholder = !!body.is_placeholder
+      if (body.can_play_from !== undefined) {
+        if (body.can_play_from === null || body.can_play_from === '') upd.can_play_from = null
+        else { const d = new Date(body.can_play_from); if (isNaN(d.getTime())) return handleCORS(NextResponse.json({ error: 'Ongeldige speelgerechtigd-datum' }, { status: 400 })); upd.can_play_from = d.toISOString() }
+      }
+      if (body.joined_at !== undefined) {
+        if (body.joined_at === null || body.joined_at === '') upd.joined_at = null
+        else { const d = new Date(body.joined_at); if (isNaN(d.getTime())) return handleCORS(NextResponse.json({ error: 'Ongeldige lid-sinds datum' }, { status: 400 })); upd.joined_at = d.toISOString() }
+      }
+      if (!Object.keys(upd).length) return handleCORS(NextResponse.json({ error: 'Geen wijzigingen opgegeven' }, { status: 400 }))
+      // Dubbele naam binnen dezelfde ploeg voorkomen
+      const checkName = upd.name ?? old.name, checkTeam = upd.team_id ?? old.team_id
+      const dup = await db.collection('players').findOne({ id: { $ne: id }, team_id: checkTeam, name: { $regex: `^${String(checkName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' } })
+      if (dup) return handleCORS(NextResponse.json({ error: `Speler "${checkName}" bestaat al bij deze ploeg` }, { status: 409 }))
+      upd.updated_at = new Date().toISOString()
+      await db.collection('players').updateOne({ id }, { $set: upd })
+      const changed = {}; for (const k of Object.keys(upd)) if (k !== 'updated_at') changed[k] = { from: old[k] ?? null, to: upd[k] }
+      let action = 'player_updated'
+      if (Object.keys(changed).length === 1 && changed.active) action = upd.active ? 'player_activated' : 'player_deactivated'
+      else if (Object.keys(changed).length === 1 && changed.team_id) action = 'player_team_changed'
+      await logAudit(db, { actor: 'admin', action, entity: 'player', entity_id: id, old_value: { name: old.name, team_id: old.team_id, active: old.active !== false }, new_value: changed })
+      const p = stripId(await db.collection('players').findOne({ id }))
+      return handleCORS(NextResponse.json({ ok: true, player: p }))
     }
     if (route.startsWith('/admin/players/') && path.length === 3 && method === 'DELETE') {
       if (!isAdmin) return handleCORS(NextResponse.json({ error: 'unauthorized' }, { status: 401 }))
       const id = path[2]
       const old = stripId(await db.collection('players').findOne({ id }))
+      if (!old) return handleCORS(NextResponse.json({ error: 'Speler niet gevonden' }, { status: 404 }))
+      const usage = await playerMatchUsage(db)
+      const cnt = usage[id] || 0
+      if (cnt > 0) return handleCORS(NextResponse.json({ error: `${old.name} komt voor op ${cnt} wedstrijdblad${cnt === 1 ? '' : 'en'} en kan daarom niet definitief verwijderd worden. Deactiveer de speler in plaats daarvan.`, match_count: cnt, can_deactivate: true }, { status: 409 }))
       await db.collection('players').deleteOne({ id })
+      await db.collection('player_change_requests').deleteMany({ player_id: id })
       await logAudit(db, { actor: 'admin', action: 'player_deleted', entity: 'player', entity_id: id, old_value: old, new_value: null })
       return handleCORS(NextResponse.json({ ok: true }))
     }
@@ -560,21 +733,176 @@ async function handleRoute(request, { params }) {
       return handleCORS(NextResponse.json({ ok: true }))
     }
 
-    // Seasons
+    // ---- Seasons ----
+    const seasonCounts = async (sid) => {
+      const f = await seasonMatchFilter(db, sid)
+      const all = await db.collection('matches').find(f, { projection: { status: 1 } }).toArray()
+      return { match_count: all.length, played_count: all.filter(m => ['confirmed', 'admin_approved'].includes(m.status)).length }
+    }
+    const seasonOverview = async (season) => {
+      const counts = await seasonCounts(season.id)
+      const f = await seasonMatchFilter(db, season.id)
+      const teams = (await db.collection('teams').find({}).toArray()).map(stripId)
+      const tmap = Object.fromEntries(teams.map(t => [t.id, t.name]))
+      const players = (await db.collection('players').find({}).toArray()).map(stripId)
+      const pmap = Object.fromEntries(players.map(p => [p.id, p.name]))
+      const matches = (await db.collection('matches').find(f).sort({ date: 1, week: 1 }).toArray()).map(stripId).map(m => ({ ...m, home_team_name: tmap[m.home_team_id] || m.home_team_name || '?', away_team_name: tmap[m.away_team_id] || m.away_team_name || '?', games: Array.isArray(m.games) ? m.games.map(g => ({ ...g, home_player_names: (g.home_players || []).map(id => pmap[id] || '?'), away_player_names: (g.away_players || []).map(id => pmap[id] || '?') })) : m.games }))
+      // Gearchiveerd met snapshot -> snapshot; anders live berekenen op basis van de wedstrijden van dit seizoen
+      const useSnapshot = !season.active && season.archived_at && Array.isArray(season.final_standings) && season.final_standings.length > 0
+      const standings = useSnapshot ? season.final_standings : await computeStandings(db, season.id)
+      const player_stats = useSnapshot ? (season.final_player_stats || []) : await computePlayerStats(db, season.id)
+      return { season: seasonPublic(season, counts), source: useSnapshot ? 'snapshot' : 'live', standings, player_stats, matches }
+    }
     if (route === '/seasons' && method === 'GET') {
       const seasons = (await db.collection('seasons').find({}).sort({ created_at: -1 }).toArray()).map(stripId)
-      return handleCORS(NextResponse.json(seasons))
+      const out = []
+      for (const sn of seasons) out.push(seasonPublic(sn, await seasonCounts(sn.id)))
+      out.sort((a, b) => (b.active - a.active) || String(b.name).localeCompare(String(a.name)))
+      return handleCORS(NextResponse.json(out))
     }
+    if (route.startsWith('/seasons/') && path.length === 3 && path[2] === 'overview' && method === 'GET') {
+      const season = stripId(await db.collection('seasons').findOne({ id: path[1] }))
+      if (!season) return handleCORS(NextResponse.json({ error: 'Seizoen niet gevonden' }, { status: 404 }))
+      return handleCORS(NextResponse.json(await seasonOverview(season)))
+    }
+    if (route === '/admin/seasons' && method === 'POST') {
+      if (!isAdmin) return handleCORS(NextResponse.json({ error: 'unauthorized' }, { status: 401 }))
+      const body = await request.json()
+      const name = String(body.name || '').trim()
+      if (!name) return handleCORS(NextResponse.json({ error: 'Naam van het seizoen is verplicht' }, { status: 400 }))
+      const dup = await db.collection('seasons').findOne({ name: { $regex: `^${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' } })
+      if (dup) return handleCORS(NextResponse.json({ error: `Er bestaat al een seizoen met de naam "${name}"` }, { status: 409 }))
+      const now = new Date().toISOString()
+      const season = { id: uuidv4(), name, active: false, start_date: body.start_date || null, end_date: body.end_date || null, description: String(body.description || '').trim(), only_singles_count: !!body.only_singles_count, created_at: now }
+      if (body.activate) {
+        const cur = await getActiveSeason(db)
+        if (cur) {
+          const standings = await computeStandings(db, cur.id); const pstats = await computePlayerStats(db, cur.id)
+          await db.collection('seasons').updateOne({ id: cur.id }, { $set: { active: false, archived_at: now, final_standings: standings, final_player_stats: pstats, champion: standings[0]?.team_name || null } })
+          await logAudit(db, { actor: 'admin', action: 'season_archived', entity: 'season', entity_id: cur.id, old_value: { name: cur.name }, new_value: { reason: 'nieuw seizoen geactiveerd', new_season: name } })
+        }
+        season.active = true
+      }
+      await db.collection('seasons').insertOne(season)
+      await logAudit(db, { actor: 'admin', action: 'season_created', entity: 'season', entity_id: season.id, old_value: null, new_value: { name, active: season.active } })
+      return handleCORS(NextResponse.json({ ok: true, season: seasonPublic(stripId(season), { match_count: 0, played_count: 0 }) }))
+    }
+    if (route.startsWith('/admin/seasons/') && path.length === 3 && (method === 'PATCH' || method === 'PUT')) {
+      if (!isAdmin) return handleCORS(NextResponse.json({ error: 'unauthorized' }, { status: 401 }))
+      const id = path[2]; const body = await request.json()
+      const season = stripId(await db.collection('seasons').findOne({ id }))
+      if (!season) return handleCORS(NextResponse.json({ error: 'Seizoen niet gevonden' }, { status: 404 }))
+      const upd = {}
+      if (body.name !== undefined) {
+        const name = String(body.name || '').trim()
+        if (!name) return handleCORS(NextResponse.json({ error: 'Naam mag niet leeg zijn' }, { status: 400 }))
+        const dup = await db.collection('seasons').findOne({ id: { $ne: id }, name: { $regex: `^${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' } })
+        if (dup) return handleCORS(NextResponse.json({ error: `Er bestaat al een seizoen met de naam "${name}"` }, { status: 409 }))
+        upd.name = name
+      }
+      if (body.start_date !== undefined) upd.start_date = body.start_date || null
+      if (body.end_date !== undefined) upd.end_date = body.end_date || null
+      if (body.description !== undefined) upd.description = String(body.description || '').trim()
+      if (body.champion !== undefined) upd.champion = body.champion ? String(body.champion).trim() : null
+      let scoringChanged = false
+      if (body.only_singles_count !== undefined && !!body.only_singles_count !== !!season.only_singles_count) {
+        if (!season.active && season.archived_at) return handleCORS(NextResponse.json({ error: 'De puntentelling van een gearchiveerd seizoen kan niet gewijzigd worden. Heractiveer het seizoen eerst.' }, { status: 400 }))
+        upd.only_singles_count = !!body.only_singles_count; scoringChanged = true
+      }
+      if (!Object.keys(upd).length) return handleCORS(NextResponse.json({ error: 'Geen wijzigingen opgegeven' }, { status: 400 }))
+      upd.updated_at = new Date().toISOString()
+      await db.collection('seasons').updateOne({ id }, { $set: upd })
+      let recalculated = null
+      if (scoringChanged) {
+        recalculated = await recalcSeasonMatches(db, id, upd.only_singles_count)
+        await logAudit(db, { actor: 'admin', action: 'season_scoring_changed', entity: 'season', entity_id: id, old_value: { only_singles_count: !!season.only_singles_count }, new_value: { only_singles_count: upd.only_singles_count, matches_recalculated: recalculated.updated } })
+      }
+      const { only_singles_count: _o, ...rest } = upd
+      if (Object.keys(rest).length > 1) await logAudit(db, { actor: 'admin', action: 'season_updated', entity: 'season', entity_id: id, old_value: { name: season.name }, new_value: rest })
+      const fresh = stripId(await db.collection('seasons').findOne({ id }))
+      return handleCORS(NextResponse.json({ ok: true, season: seasonPublic(fresh, await seasonCounts(id)), recalculated }))
+    }
+    if (route.startsWith('/admin/seasons/') && path.length === 4 && path[3] === 'archive' && method === 'POST') {
+      if (!isAdmin) return handleCORS(NextResponse.json({ error: 'unauthorized' }, { status: 401 }))
+      const id = path[2]
+      const season = stripId(await db.collection('seasons').findOne({ id }))
+      if (!season) return handleCORS(NextResponse.json({ error: 'Seizoen niet gevonden' }, { status: 404 }))
+      if (season.archived_at && !season.active) return handleCORS(NextResponse.json({ error: 'Seizoen is al gearchiveerd' }, { status: 400 }))
+      const standings = await computeStandings(db, id); const pstats = await computePlayerStats(db, id)
+      await db.collection('seasons').updateOne({ id }, { $set: { active: false, archived_at: new Date().toISOString(), final_standings: standings, final_player_stats: pstats, champion: standings[0]?.team_name || null } })
+      await logAudit(db, { actor: 'admin', action: 'season_archived', entity: 'season', entity_id: id, old_value: { name: season.name, active: season.active }, new_value: { champion: standings[0]?.team_name || null } })
+      return handleCORS(NextResponse.json({ ok: true, champion: standings[0]?.team_name || null, no_active_season: !(await getActiveSeason(db)) }))
+    }
+    if (route.startsWith('/admin/seasons/') && path.length === 4 && path[3] === 'activate' && method === 'POST') {
+      if (!isAdmin) return handleCORS(NextResponse.json({ error: 'unauthorized' }, { status: 401 }))
+      const id = path[2]
+      const season = stripId(await db.collection('seasons').findOne({ id }))
+      if (!season) return handleCORS(NextResponse.json({ error: 'Seizoen niet gevonden' }, { status: 404 }))
+      if (season.active) return handleCORS(NextResponse.json({ error: 'Dit seizoen is al actief' }, { status: 400 }))
+      const now = new Date().toISOString()
+      const cur = await getActiveSeason(db)
+      if (cur) {
+        const standings = await computeStandings(db, cur.id); const pstats = await computePlayerStats(db, cur.id)
+        await db.collection('seasons').updateOne({ id: cur.id }, { $set: { active: false, archived_at: now, final_standings: standings, final_player_stats: pstats, champion: standings[0]?.team_name || null } })
+        await logAudit(db, { actor: 'admin', action: 'season_archived', entity: 'season', entity_id: cur.id, old_value: { name: cur.name }, new_value: { reason: `seizoen ${season.name} geactiveerd` } })
+      }
+      // Heractiveren: snapshot wissen zodat alles weer live berekend wordt
+      await db.collection('seasons').updateOne({ id }, { $set: { active: true, reactivated_at: now }, $unset: { archived_at: '', final_standings: '', final_player_stats: '', champion: '' } })
+      await logAudit(db, { actor: 'admin', action: 'season_activated', entity: 'season', entity_id: id, old_value: { archived: !!season.archived_at }, new_value: { name: season.name, previous_active: cur?.name || null } })
+      return handleCORS(NextResponse.json({ ok: true, archived_previous: cur ? cur.name : null }))
+    }
+    if (route.startsWith('/admin/seasons/') && path.length === 3 && method === 'DELETE') {
+      if (!isAdmin) return handleCORS(NextResponse.json({ error: 'unauthorized' }, { status: 401 }))
+      const id = path[2]
+      const season = stripId(await db.collection('seasons').findOne({ id }))
+      if (!season) return handleCORS(NextResponse.json({ error: 'Seizoen niet gevonden' }, { status: 404 }))
+      if (season.active) return handleCORS(NextResponse.json({ error: 'Het actieve seizoen kan niet verwijderd worden. Archiveer het eerst of activeer een ander seizoen.' }, { status: 400 }))
+      const matchIds = (await db.collection('matches').find({ season_id: id }, { projection: { id: 1 } }).toArray()).map(m => m.id)
+      const delMatches = await db.collection('matches').deleteMany({ season_id: id })
+      if (matchIds.length) await db.collection('date_change_requests').deleteMany({ match_id: { $in: matchIds } })
+      await db.collection('seasons').deleteOne({ id })
+      await logAudit(db, { actor: 'admin', action: 'season_deleted', entity: 'season', entity_id: id, old_value: { name: season.name, champion: season.champion || null, matches_deleted: delMatches.deletedCount }, new_value: null })
+      return handleCORS(NextResponse.json({ ok: true, matches_deleted: delMatches.deletedCount }))
+    }
+    if (route.startsWith('/admin/seasons/') && path.length === 4 && path[3] === 'export' && method === 'GET') {
+      if (!isAdmin) return handleCORS(NextResponse.json({ error: 'unauthorized' }, { status: 401 }))
+      const season = stripId(await db.collection('seasons').findOne({ id: path[2] }))
+      if (!season) return handleCORS(NextResponse.json({ error: 'Seizoen niet gevonden' }, { status: 404 }))
+      const ov = await seasonOverview(season)
+      const statusNL = { scheduled: 'Gepland', submitted: 'Ingediend', confirmed: 'Bevestigd', disputed: 'Betwist', admin_approved: 'Goedgekeurd (admin)' }
+      const wb = XLSX.utils.book_new()
+      const info = [
+        ['Seizoen', ov.season.name], ['Status', ov.season.status === 'active' ? 'Actief' : ov.season.status === 'archived' ? 'Gearchiveerd' : 'Gepland'],
+        ['Startdatum', ov.season.start_date || ''], ['Einddatum', ov.season.end_date || ''], ['Kampioen', ov.season.champion || (ov.standings[0]?.team_name || '')],
+        ['Alleen enkelwedstrijden tellen voor ploegstand', ov.season.only_singles_count ? 'JA' : 'NEE'],
+        ['Aantal wedstrijden', ov.season.match_count], ['Gespeeld', ov.season.played_count], ['Bron', ov.source === 'snapshot' ? 'Snapshot bij archivering' : 'Live berekend'], ['Geëxporteerd op', new Date().toLocaleString('nl-BE')],
+      ]
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(info), 'Info')
+      const st = [['#', 'Ploeg', 'Gespeeld', 'Gewonnen', 'Gelijk', 'Verloren', 'Ploegpunten +', 'Ploegpunten -', 'Saldo', 'Frames +', 'Frames -', 'Framebalans', 'Competitiepunten']]
+      ov.standings.forEach((r, i) => st.push([i + 1, r.team_name, r.played ?? '', r.won ?? '', r.drawn ?? '', r.lost ?? '', r.points_for ?? '', r.points_against ?? '', r.saldo ?? '', r.frames_won ?? '', r.frames_lost ?? '', r.framebalans ?? '', r.total_points ?? r.comp_points ?? '']))
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(st), 'Ploegstand')
+      const ps = [['#', 'Speler', 'Ploeg', 'Gespeeld', 'Gewonnen', 'Verloren', 'Win %', 'Enkel gespeeld', 'Enkel gewonnen', 'Dubbel gespeeld', 'Dubbel gewonnen', 'Frames +', 'Frames -', 'Framebalans', 'Punten']]
+      ov.player_stats.forEach((r, i) => ps.push([i + 1, r.name, r.team_name, r.played ?? '', r.won ?? '', r.lost ?? '', r.win_pct ?? '', r.enkel_played ?? '', r.enkel_won ?? '', r.dubbel_played ?? '', r.dubbel_won ?? '', r.total_frames_won ?? '', r.total_frames_lost ?? '', r.framebalans ?? '', r.points ?? '']))
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(ps), 'Individueel klassement')
+      const ms = [['Speeldag', 'Datum', 'Thuis', 'Uit', 'Status', 'Ploegpunten thuis', 'Ploegpunten uit', 'Frames thuis', 'Frames uit', 'Opmerkingen']]
+      for (const m of ov.matches) { const fh = (m.games || []).reduce((a, g) => a + (Number(g.home_frames) || 0), 0); const fa = (m.games || []).reduce((a, g) => a + (Number(g.away_frames) || 0), 0); ms.push([m.week ?? '', (m.date || '').substring(0, 10), m.home_team_name, m.away_team_name, statusNL[m.status] || m.status, m.points_home ?? '', m.points_away ?? '', m.games ? fh : '', m.games ? fa : '', m.remarks || '']) }
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(ms), 'Wedstrijden')
+      const gs = [['Speeldag', 'Datum', 'Thuis', 'Uit', 'Partij', 'Type', 'Speler(s) thuis', 'Speler(s) uit', 'Sets thuis', 'Sets uit', 'Forfait', 'Telt voor ploegstand']]
+      for (const m of ov.matches) { if (!Array.isArray(m.games)) continue; m.games.forEach((g, i) => gs.push([m.week ?? '', (m.date || '').substring(0, 10), m.home_team_name, m.away_team_name, i + 1, g.type, (g.home_player_names || []).join(' & '), (g.away_player_names || []).join(' & '), g.home_frames ?? '', g.away_frames ?? '', g.forfait_home ? 'Thuis' : g.forfait_away ? 'Uit' : '', (ov.season.only_singles_count && g.type === 'dubbel') ? 'NEE' : 'JA'])) }
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(gs), 'Partijen')
+      const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' })
+      const fname = `pool-competitie-${String(ov.season.name).replace(/[^a-zA-Z0-9-_]+/g, '_')}.xlsx`
+      return handleCORS(new NextResponse(buf, { status: 200, headers: { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition': `attachment; filename="${fname}"` } }))
+    }
+    // Legacy: archiveer actief seizoen en start meteen een nieuw seizoen
     if (route === '/admin/seasons/archive' && method === 'POST') {
       if (!isAdmin) return handleCORS(NextResponse.json({ error: 'unauthorized' }, { status: 401 }))
       const body = await request.json()
-      const active = stripId(await db.collection('seasons').findOne({ active: true }))
+      const active = await getActiveSeason(db)
       if (!active) return handleCORS(NextResponse.json({ error: 'no active season' }, { status: 400 }))
-      // snapshot standings & player stats
-      const standings = await computeStandings(db)
-      const pstats = await computePlayerStats(db)
+      const standings = await computeStandings(db, active.id)
+      const pstats = await computePlayerStats(db, active.id)
       await db.collection('seasons').updateOne({ id: active.id }, { $set: { active: false, archived_at: new Date().toISOString(), final_standings: standings, final_player_stats: pstats, champion: standings[0]?.team_name || null } })
-      // new season
       const newSeason = { id: uuidv4(), name: body.name || 'Nieuw seizoen', active: true, created_at: new Date().toISOString() }
       await db.collection('seasons').insertOne(newSeason)
       await logAudit(db, { actor: 'admin', action: 'season_archived', entity: 'season', entity_id: active.id, old_value: { name: active.name }, new_value: { new_season: newSeason.name } })
@@ -583,7 +911,9 @@ async function handleRoute(request, { params }) {
 
     // Calendar public
     if (route === '/calendar' && method === 'GET') {
-      const matches = (await db.collection('matches').find({}).sort({ week: 1, date: 1 }).toArray()).map(stripId)
+      const sq = url.searchParams.get('season_id')
+      const mf = sq === 'all' ? {} : await seasonMatchFilter(db, sq || undefined)
+      const matches = (await db.collection('matches').find(mf).sort({ week: 1, date: 1 }).toArray()).map(stripId)
       const teams = (await db.collection('teams').find({}).toArray()).map(stripId)
       const tmap = Object.fromEntries(teams.map(t => [t.id, t.name]))
       return handleCORS(NextResponse.json(matches.map(m => ({ ...m, home_team_name: tmap[m.home_team_id], away_team_name: tmap[m.away_team_id] }))))
